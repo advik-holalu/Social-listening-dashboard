@@ -38,34 +38,6 @@ SECRET_SHEET_KEY = "SHEET_KEY"
 SECRET_WORKSHEET = "WORKSHEET_NAME"
 DEFAULT_WORKSHEET = "comments"
 
-# Video transcript summaries live on their own tab, keyed by video_id. One row
-# per video rather than per comment: a popular video has hundreds of comments
-# and they all share the same summary.
-SECRET_VIDEO_WORKSHEET = "VIDEO_WORKSHEET_NAME"
-DEFAULT_VIDEO_WORKSHEET = "videos"
-VIDEO_ID_COLUMN = "video_id"
-# Written summaries live on their own tab, one row per comment set. They cost
-# a Claude call to produce, so they outlive the process that made them.
-SECRET_DIGEST_WORKSHEET = "DIGEST_WORKSHEET_NAME"
-DEFAULT_DIGEST_WORKSHEET = "digests"
-DIGEST_ID_COLUMN = "fingerprint"
-DIGEST_COLUMNS: list[str] = [
-    "fingerprint",
-    "keywords",
-    "comments",
-    "digest",
-    "written_at",
-]
-
-VIDEO_COLUMNS: list[str] = [
-    "video_id",
-    "video_title",
-    "video_url",
-    "video_summary",
-    "transcript_language",
-    "transcript_is_english",
-    "summarized_at",
-]
 
 # Columns that should come back as numbers, not strings, after a round-trip
 # through Sheets (everything arrives as text).
@@ -194,8 +166,6 @@ def _get_worksheet() -> gspread.Worksheet:
     return _get_worksheet_cached(_sheet_key(), worksheet_name)
 
 
-
-
 def _column_letter(index: int) -> str:
     """1-based column number to its A1 letter, e.g. 1 -> A, 27 -> AA."""
     letters = ""
@@ -229,195 +199,9 @@ def _widen_header(worksheet: gspread.Worksheet, header: Sequence[str]) -> list[s
 
 
 @st.cache_resource(show_spinner=False)
-def _get_video_worksheet_cached(
-    sheet_key: str, worksheet_name: str
-) -> gspread.Worksheet:
-    """The videos tab, opened once per session off the shared handle."""
-    spreadsheet = _get_spreadsheet(sheet_key)
-    try:
-        worksheet = spreadsheet.worksheet(worksheet_name)
-    except WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=worksheet_name, rows=1000, cols=len(VIDEO_COLUMNS)
-        )
-        worksheet.update(range_name="A1", values=[VIDEO_COLUMNS])
-        return worksheet
-    except APIError as exc:
-        raise SheetsError(f"Could not open the '{worksheet_name}' tab: {exc}") from exc
-
-    if not worksheet.row_values(1):
-        worksheet.update(range_name="A1", values=[VIDEO_COLUMNS])
-
-    return worksheet
-
-
-def _get_video_worksheet() -> gspread.Worksheet:
-    """Open (or create) the tab holding one summary row per video."""
-    worksheet_name = str(
-        st.secrets.get(SECRET_VIDEO_WORKSHEET, DEFAULT_VIDEO_WORKSHEET)
-    ).strip() or DEFAULT_VIDEO_WORKSHEET
-    return _get_video_worksheet_cached(_sheet_key(), worksheet_name)
-
-
-def load_video_summaries() -> pd.DataFrame:
-    """Read every stored video summary, one row per video_id."""
-    try:
-        worksheet = _get_video_worksheet()
-        values = worksheet.get_all_values()
-    except APIError as exc:
-        raise SheetsError(f"Could not read the video summaries: {exc}") from exc
-
-    if len(values) < 2:
-        return pd.DataFrame(columns=VIDEO_COLUMNS)
-
-    header, *data = values
-    df = pd.DataFrame(data, columns=header)
-    for column in VIDEO_COLUMNS:
-        if column not in df.columns:
-            df[column] = ""
-    df = df[VIDEO_COLUMNS]
-    df = df[df[VIDEO_ID_COLUMN].astype(str).str.strip() != ""]
-    return df.reset_index(drop=True)
-
-
-def summary_lookup(df: pd.DataFrame) -> dict[str, str]:
-    """video_id -> summary text, skipping videos whose summary came back blank."""
-    if df.empty:
-        return {}
-    return {
-        str(record[VIDEO_ID_COLUMN]).strip(): str(record["video_summary"]).strip()
-        for _, record in df.iterrows()
-        if str(record.get("video_summary", "")).strip()
-    }
-
-
-def save_video_summaries(rows: Sequence[dict]) -> tuple[int, int]:
-    """Append video summary rows, skipping video_ids already on the tab.
-
-    Returns (appended_count, skipped_count). Append-only by design: a video's
-    transcript does not change, so the first summary stands.
-    """
-    if not rows:
-        return 0, 0
-
-    worksheet = _get_video_worksheet()
-    try:
-        known = {
-            value.strip()
-            for value in worksheet.col_values(VIDEO_COLUMNS.index(VIDEO_ID_COLUMN) + 1)[1:]
-            if value and value.strip()
-        }
-    except APIError as exc:
-        raise SheetsError(f"Could not read existing video ids: {exc}") from exc
-
-    header = worksheet.row_values(1) or list(VIDEO_COLUMNS)
-
-    fresh: list[list] = []
-    seen_in_batch: set[str] = set()
-    skipped = 0
-
-    for row in rows:
-        video_id = str(row.get(VIDEO_ID_COLUMN, "")).strip()
-        if not video_id or video_id in known or video_id in seen_in_batch:
-            skipped += 1
-            continue
-        seen_in_batch.add(video_id)
-        fresh.append([_cell(row.get(column, "")) for column in header])
-
-    if not fresh:
-        return 0, skipped
-
-    try:
-        for start in range(0, len(fresh), _APPEND_CHUNK):
-            worksheet.append_rows(
-                fresh[start : start + _APPEND_CHUNK], value_input_option="RAW"
-            )
-    except APIError as exc:
-        raise SheetsError(f"Could not write the video summaries: {exc}") from exc
-
-    return len(fresh), skipped
 
 
 @st.cache_resource(show_spinner=False)
-def _get_digest_worksheet_cached(
-    sheet_key: str, worksheet_name: str
-) -> gspread.Worksheet:
-    """The digests tab, opened once per session off the shared handle."""
-    spreadsheet = _get_spreadsheet(sheet_key)
-    try:
-        worksheet = spreadsheet.worksheet(worksheet_name)
-    except WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=worksheet_name, rows=500, cols=len(DIGEST_COLUMNS)
-        )
-        worksheet.update(range_name="A1", values=[DIGEST_COLUMNS])
-        return worksheet
-    except APIError as exc:
-        raise SheetsError(f"Could not open the '{worksheet_name}' tab: {exc}") from exc
-
-    if not worksheet.row_values(1):
-        worksheet.update(range_name="A1", values=[DIGEST_COLUMNS])
-    return worksheet
-
-
-def _get_digest_worksheet() -> gspread.Worksheet:
-    worksheet_name = str(
-        st.secrets.get(SECRET_DIGEST_WORKSHEET, DEFAULT_DIGEST_WORKSHEET)
-    ).strip() or DEFAULT_DIGEST_WORKSHEET
-    return _get_digest_worksheet_cached(_sheet_key(), worksheet_name)
-
-
-def load_digests() -> dict[str, str]:
-    """Every stored summary, keyed by the fingerprint of its comment set."""
-    try:
-        worksheet = _get_digest_worksheet()
-        values = worksheet.get_all_values()
-    except APIError as exc:
-        raise SheetsError(f"Could not read the stored summaries: {exc}") from exc
-
-    if len(values) < 2:
-        return {}
-
-    header, *data = values
-    try:
-        key_at = header.index(DIGEST_ID_COLUMN)
-        text_at = header.index("digest")
-    except ValueError:
-        return {}
-
-    out: dict[str, str] = {}
-    for row in data:
-        if len(row) <= max(key_at, text_at):
-            continue
-        key, text = str(row[key_at]).strip(), str(row[text_at]).strip()
-        if key and text:
-            out[key] = text
-    return out
-
-
-def save_digest(fingerprint: str, keywords: str, comments: int, digest: str) -> bool:
-    """Store one summary. Returns False when that fingerprint is already there."""
-    if not fingerprint or not digest.strip():
-        return False
-
-    worksheet = _get_digest_worksheet()
-    try:
-        known = {
-            value.strip()
-            for value in worksheet.col_values(
-                DIGEST_COLUMNS.index(DIGEST_ID_COLUMN) + 1
-            )[1:]
-            if value and value.strip()
-        }
-        if fingerprint in known:
-            return False
-        worksheet.append_rows(
-            [[fingerprint, keywords, int(comments), digest, _dt.datetime.now().isoformat()]],
-            value_input_option="RAW",
-        )
-    except APIError as exc:
-        raise SheetsError(f"Could not store the summary: {exc}") from exc
-    return True
 
 
 def to_dataframe(rows: Sequence[dict]) -> pd.DataFrame:

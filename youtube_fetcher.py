@@ -13,14 +13,11 @@ import datetime as _dt
 import json
 import logging
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Sequence
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-
-import transcripts
 
 # The raw API error goes here as well as into the message the user sees.
 _LOG = logging.getLogger(__name__)
@@ -73,29 +70,13 @@ class InvalidAPIKeyError(YouTubeError):
 
 @dataclass
 class FetchReport:
-    """What a run produced beyond the comment rows themselves.
-
-    Mostly non-fatal warnings surfaced in the UI afterwards, plus the video
-    summaries collected along the way -- those are keyed by video_id rather than
-    per comment row, because one video's summary serves all of its comments.
-    """
+    """Non-fatal things that happened during a run, surfaced in the UI after."""
 
     warnings: list[str] = field(default_factory=list)
     videos_searched: int = 0
     videos_with_comments: int = 0
     comments_fetched: int = 0
     quota_exhausted: bool = False
-    transcripts_found: int = 0
-    transcripts_missing: int = 0
-    transcripts_blocked: int = 0
-    transcripts_error: int = 0
-    transcripts_attempted: int = 0
-    # Set once YouTube blocks this IP. Further fetches are pointless, so the
-    # rest of the run stops asking instead of hammering a closed door.
-    transcripts_halted: bool = False
-    video_summaries: dict[str, dict] = field(default_factory=dict)
-    # video_id -> why its transcript did not arrive, for the per-video message.
-    transcript_outcomes: dict[str, str] = field(default_factory=dict)
 
     def warn(self, message: str) -> None:
         if message not in self.warnings:
@@ -105,100 +86,8 @@ class FetchReport:
 # Progress callback: (current, total, label) -> None
 ProgressCallback = Callable[[int, int, str], None]
 
-# Seconds to wait between transcript fetches. The endpoint is unofficial and
-# rate limited by IP; twenty back-to-back requests per keyword is what got this
-# IP blocked in the first place, so the calls are spaced out.
-TRANSCRIPT_DELAY_SECONDS = 1.5
-
-# Summariser: (video_title, transcript_text, language) -> 2-3 sentence summary.
-# Injected by the caller so this module stays free of Streamlit and Claude.
-Summarizer = Callable[[str, str, str], str]
 
 
-def collect_video_summary(
-    video: dict,
-    summarizer: Summarizer | None,
-    report: FetchReport | None = None,
-) -> dict | None:
-    """Fetch one video's transcript and summarise it.
-
-    Returns a row for the videos sheet, or None when the video has no usable
-    transcript. Transcript fetching is unofficial and summarising is a network
-    call to Claude; neither is allowed to raise into the search loop, so every
-    failure here degrades to "no summary for this video".
-    """
-    video_id = video.get("video_id", "")
-    if not video_id:
-        return None
-
-    # Once blocked, stop asking. The remaining videos are recorded as blocked
-    # rather than retried one by one against an IP that is already refused.
-    if report is not None and report.transcripts_halted:
-        report.transcripts_blocked += 1
-        report.transcript_outcomes[video_id] = transcripts.BLOCKED
-        return None
-
-    # Space the calls out. The first fetch of a run goes straight through; the
-    # delay only sits between requests.
-    if report is not None and report.transcripts_attempted:
-        time.sleep(TRANSCRIPT_DELAY_SECONDS)
-    if report is not None:
-        report.transcripts_attempted += 1
-
-    try:
-        result = transcripts.fetch_transcript(video_id)
-    except Exception as exc:  # the library should not raise, but it is theirs
-        result = transcripts.TranscriptResult(transcripts.ERROR, detail=str(exc))
-
-    if report is not None:
-        report.transcript_outcomes[video_id] = result.outcome
-
-    if result.outcome == transcripts.BLOCKED:
-        if report is not None:
-            report.transcripts_blocked += 1
-            report.transcripts_halted = True
-            report.warn(
-                "YouTube is rate limiting transcript downloads from this IP, so "
-                "the rest of this run skipped them. They are not missing "
-                "captions; try again later."
-            )
-        return None
-
-    if result.outcome == transcripts.ERROR:
-        if report is not None:
-            report.transcripts_error += 1
-            report.warn(f"Transcript fetch failed for {video_id}: {result.detail}")
-        return None
-
-    transcript = result.transcript
-    if transcript is None:
-        if report is not None:
-            report.transcripts_missing += 1
-        return None
-
-    if report is not None:
-        report.transcripts_found += 1
-
-    summary = ""
-    if summarizer is not None:
-        try:
-            summary = summarizer(
-                video.get("video_title", ""), transcript.text, transcript.language
-            )
-        except Exception as exc:
-            if report is not None:
-                report.warn(f"Could not summarise video {video_id}: {exc}")
-            summary = ""
-
-    return {
-        "video_id": video_id,
-        "video_title": video.get("video_title", ""),
-        "video_url": video.get("video_url", ""),
-        "video_summary": summary,
-        "transcript_language": transcript.language,
-        "transcript_is_english": transcript.is_english,
-        "summarized_at": _now_iso(),
-    }
 
 
 def _now_iso() -> str:
@@ -572,51 +461,92 @@ def parse_keywords(raw: str) -> list[str]:
     return list(seen)
 
 
-def run_search(
+MATCH_ANY = "Any"
+MATCH_ALL = "All"
+
+
+def build_queries(keywords: Sequence[str], match: str = MATCH_ANY) -> list[str]:
+    """The search strings to send, from the parsed keywords.
+
+    "Any" searches each keyword separately and pools the results, which finds
+    variants of a name. "All" joins them into one query, so YouTube has to
+    satisfy every term at once -- one search call however many terms it holds.
+    """
+    cleaned = [str(k).strip() for k in keywords if str(k).strip()]
+    if not cleaned:
+        return []
+    if match == MATCH_ALL:
+        return [" ".join(cleaned)]
+    return cleaned
+
+
+def _round_robin(by_query: dict[str, list[dict]], limit: int) -> list[tuple[str, dict]]:
+    """Take from each query in turn until the shared limit is reached.
+
+    A fair share rather than a fixed slice: taking turns means a query with
+    few results does not waste its allocation, and one with many cannot crowd
+    the others out of the front of the list.
+    """
+    taken: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+    depth = 0
+    deepest = max((len(v) for v in by_query.values()), default=0)
+
+    while depth < deepest and len(taken) < limit:
+        for query, videos in by_query.items():
+            if len(taken) >= limit:
+                break
+            if depth >= len(videos):
+                continue
+            video = videos[depth]
+            if video["video_id"] in seen:
+                continue
+            seen.add(video["video_id"])
+            taken.append((query, video))
+        depth += 1
+    return taken
+
+
+def preview_videos(
     api_key: str,
     keywords: Sequence[str],
     max_videos: int = 20,
-    max_comments: int = 500,
     order: str = "relevance",
-    include_replies: bool = True,
     published_after: _dt.datetime | None = None,
     region_code: str | None = None,
+    match: str = MATCH_ANY,
     progress_cb: ProgressCallback | None = None,
-    summarizer: Summarizer | None = None,
-    known_video_ids: Iterable[str] | None = None,
 ) -> tuple[list[dict], FetchReport]:
-    """Run a full search across every keyword and return flat comment rows.
+    """Stage one: find the videos and their stats, and stop there.
 
-    Returns (rows, report). Partial results are always returned -- if the quota
-    runs out halfway through, whatever was collected up to that point comes back
-    with report.quota_exhausted set, instead of the run raising and losing everything.
+    The cheap half of a search: one search.list page per query (100 units) and
+    a single batched videos.list for the whole result set (1 unit). No
+    commentThreads calls, so nothing here spends the part of the quota that
+    scales with videos.
 
-    Each video new to this run also gets its transcript pulled and summarised
-    into report.video_summaries. `known_video_ids` lists videos already
-    summarised on a previous run, which are skipped -- a transcript is only ever
-    fetched and summarised once per video.
+    `max_videos` is the ceiling for the run as a whole, not per query. With
+    several queries the results are taken in turn until that ceiling is met,
+    so adding a keyword splits the same budget rather than multiplying it.
     """
     report = FetchReport()
-    rows: list[dict] = []
-    fetched_at = _now_iso()
-    seen_videos = {str(vid) for vid in (known_video_ids or ())}
+    queries = build_queries(keywords, match)
+    if not queries:
+        return [], report
 
     youtube = build_client(api_key)
+    total = max(1, len(queries))
+    by_query: dict[str, list[dict]] = {}
 
-    # Total steps = one unit of work per (keyword, video) pair, used for the bar.
-    total_steps = max(1, len(keywords) * max_videos)
-    step = 0
-
-    def tick(label: str) -> None:
+    for index, query in enumerate(queries, start=1):
         if progress_cb is not None:
-            progress_cb(min(step, total_steps), total_steps, label)
-
-    for keyword in keywords:
-        tick(f"Searching YouTube for '{keyword}'...")
+            progress_cb(index - 1, total, f"Searching YouTube for '{query}'...")
         try:
+            # One page covers up to 50 results and costs the same whatever we
+            # ask for, so each query offers its full list and the sharing
+            # happens below.
             videos = search_videos(
                 youtube,
-                keyword,
+                query,
                 max_results=max_videos,
                 order=order,
                 published_after=published_after,
@@ -628,72 +558,134 @@ def run_search(
             break
         except YouTubeError as exc:
             report.warn(str(exc))
-            step += max_videos
             continue
 
         if not videos:
-            report.warn(f"No videos found for '{keyword}'.")
-            step += max_videos
+            report.warn(f"No videos found for '{query}'.")
             continue
+        by_query[query] = videos
 
-        report.videos_searched += len(videos)
+    chosen = _round_robin(by_query, max_videos)
+    report.videos_searched = len(chosen)
 
-        # One batched stats call per keyword rather than one per video.
+    found: dict[str, dict] = {}
+    for query, video in chosen:
+        video_id = video["video_id"]
+        if video_id in found:
+            if query not in found[video_id]["keywords"]:
+                found[video_id]["keywords"].append(query)
+            continue
+        found[video_id] = {
+            "video_id": video_id,
+            "keywords": [query],
+            "video_title": video["video_title"],
+            "channel_title": video["channel_title"],
+            "video_url": video["video_url"],
+            "video_published_at": video["video_published_at"],
+            "video_views": 0,
+            "video_likes": 0,
+            "video_comment_count": 0,
+            "video_type": "",
+        }
+
+    # A video found under one query may also appear under another further down
+    # its list; note those so the row carries every query that matched it.
+    for query, videos in by_query.items():
+        for video in videos:
+            entry = found.get(video["video_id"])
+            if entry is not None and query not in entry["keywords"]:
+                entry["keywords"].append(query)
+
+    # One batched stats call for the whole selection, not one per query.
+    if found:
         try:
-            stats = get_video_stats(youtube, [v["video_id"] for v in videos])
+            stats = get_video_stats(youtube, list(found))
         except QuotaExceededError as exc:
             report.quota_exhausted = True
             report.warn(str(exc))
-            break
+            stats = {}
+        for video_id, entry in found.items():
+            detail = stats.get(video_id, {})
+            entry["video_title"] = detail.get("video_title") or entry["video_title"]
+            entry["channel_title"] = (
+                detail.get("channel_title") or entry["channel_title"]
+            )
+            entry["video_published_at"] = (
+                detail.get("video_published_at") or entry["video_published_at"]
+            )
+            entry["video_views"] = detail.get("video_views", 0)
+            entry["video_likes"] = detail.get("video_likes", 0)
+            entry["video_comment_count"] = detail.get("video_comment_count", 0)
+            entry["video_type"] = detail.get("video_type", "")
 
-        for index, video in enumerate(videos, start=1):
-            step += 1
-            tick(f"'{keyword}' - video {index}/{len(videos)}: {video['video_title'][:60]}")
+    if progress_cb is not None:
+        progress_cb(total, total, "Done.")
+    return list(found.values()), report
 
-            # Transcript and summary happen once per video, across all keywords.
-            if video["video_id"] not in seen_videos:
-                seen_videos.add(video["video_id"])
-                summary_row = collect_video_summary(video, summarizer, report)
-                if summary_row is not None:
-                    report.video_summaries[video["video_id"]] = summary_row
 
-            try:
-                comments = get_comments(
-                    youtube,
-                    video["video_id"],
-                    max_comments=max_comments,
-                    include_replies=include_replies,
-                    report=report,
-                )
-            except QuotaExceededError as exc:
-                report.quota_exhausted = True
-                report.warn(str(exc))
-                # Bail out of everything, but keep the rows already collected.
-                return rows, report
+def fetch_comments_for(
+    api_key: str,
+    videos: Sequence[dict],
+    max_comments: int = 500,
+    include_replies: bool = True,
+    progress_cb: ProgressCallback | None = None,
+) -> tuple[list[dict], FetchReport]:
+    """Stage two: pull comments for videos the reader chose to keep.
 
-            if not comments:
-                continue
+    Each video is read once even when several keywords matched it; a row is
+    emitted per matching keyword, as before, and the sheet dedupes on
+    comment_id. Partial results always come back: if the quota runs out
+    halfway, whatever was collected so far is returned with
+    report.quota_exhausted set rather than the run raising.
+    """
+    report = FetchReport()
+    rows: list[dict] = []
+    fetched_at = _now_iso()
 
-            report.videos_with_comments += 1
-            video_stats = stats.get(video["video_id"], {})
+    youtube = build_client(api_key)
+    total = max(1, len(videos))
 
+    for index, video in enumerate(videos, start=1):
+        if progress_cb is not None:
+            progress_cb(
+                index - 1, total,
+                f"Video {index}/{total}: {str(video.get('video_title', ''))[:60]}",
+            )
+
+        report.videos_searched += 1
+        try:
+            comments = get_comments(
+                youtube,
+                video["video_id"],
+                max_comments=max_comments,
+                include_replies=include_replies,
+                report=report,
+            )
+        except QuotaExceededError as exc:
+            report.quota_exhausted = True
+            report.warn(str(exc))
+            report.comments_fetched = len(rows)
+            return rows, report
+
+        if not comments:
+            continue
+
+        report.videos_with_comments += 1
+        for keyword in video.get("keywords") or [""]:
             for comment in comments:
                 rows.append(
                     {
                         "comment_id": comment["comment_id"],
                         "keyword": keyword,
                         "video_id": video["video_id"],
-                        "video_title": video_stats.get("video_title")
-                        or video["video_title"],
-                        "channel_title": video_stats.get("channel_title")
-                        or video["channel_title"],
-                        "video_url": video["video_url"],
-                        "video_published_at": video_stats.get("video_published_at")
-                        or video["video_published_at"],
-                        "video_views": video_stats.get("video_views", 0),
-                        "video_likes": video_stats.get("video_likes", 0),
-                        "video_comment_count": video_stats.get("video_comment_count", 0),
-                        "video_type": video_stats.get("video_type", ""),
+                        "video_title": video.get("video_title", ""),
+                        "channel_title": video.get("channel_title", ""),
+                        "video_url": video.get("video_url", ""),
+                        "video_published_at": video.get("video_published_at", ""),
+                        "video_views": video.get("video_views", 0),
+                        "video_likes": video.get("video_likes", 0),
+                        "video_comment_count": video.get("video_comment_count", 0),
+                        "video_type": video.get("video_type", ""),
                         "comment_author": comment["comment_author"],
                         "comment_text": comment["comment_text"],
                         "comment_likes": comment["comment_likes"],
@@ -706,5 +698,6 @@ def run_search(
                 )
 
     report.comments_fetched = len(rows)
-    tick("Done.")
+    if progress_cb is not None:
+        progress_cb(total, total, "Done.")
     return rows, report
