@@ -82,20 +82,15 @@ top of the results filters every view.
 Rows collected before this existed have no `video_type`; they show under **All**
 and the app says how many rather than dropping them silently.
 
-## Searching, in two steps
+## Searching
 
-**Run Search** does the cheap half only: one `search.list` page per keyword and
-one batched `videos.list` for the stats. No comments are pulled and nothing is
-written.
+**Run Search** is the whole job in one click. It finds the videos (one
+`search.list` page per keyword plus one batched `videos.list` for their stats),
+reads the comments on every video it found, and saves them. The progress bar
+runs through both halves and the report appears when it finishes.
 
-What comes back is a list of the videos found, each with a tick box, its title,
-channel, view count, comment count and the keyword that matched it. Everything
-starts ticked, so leaving it alone costs one extra click. Untick anything
-irrelevant (a generic keyword like "Spicy" will drag in unrelated videos), then
-press **Fetch comments and save**.
-
-That is the only chance to exclude a bad match: saving is automatic once the
-comments are fetched.
+A new search replaces the one before it in the report. Earlier searches stay in
+the Sheet and are downloadable from **Past searches** in the sidebar.
 
 ## Saving
 
@@ -143,13 +138,11 @@ the terms take turns filling the cap, so a term with few results does not waste
 its share and a busy term cannot crowd the others out. A video found by two
 terms is listed once, carrying both.
 
-Cost splits across the two steps. Searching is **100 units per query plus 1**
-for a single batched stats call, spent when you press Run Search: three terms
-matched any is 301, while matching all together is 101 however many terms it
-joins. Reading comments
-is **5 units per video kept**, spent only when you confirm, so unticking videos
-lowers it. The Details box shows both figures and the preview updates the second
-as you tick. Quota resets at midnight Pacific Time.
+Cost has two parts. Searching is **100 units per query plus 1** for a single
+batched stats call: three terms matched any is 301, while matching all together
+is 101 however many terms it joins. Reading comments is **5 units per video**,
+so the ceiling follows Videos to query. The Details box in the sidebar shows
+both figures before you run. Quota resets at midnight Pacific Time.
 
 ## Startup
 

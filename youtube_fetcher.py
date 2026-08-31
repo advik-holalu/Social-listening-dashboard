@@ -507,7 +507,7 @@ def _round_robin(by_query: dict[str, list[dict]], limit: int) -> list[tuple[str,
     return taken
 
 
-def preview_videos(
+def find_videos(
     api_key: str,
     keywords: Sequence[str],
     max_videos: int = 20,
@@ -517,7 +517,7 @@ def preview_videos(
     match: str = MATCH_ANY,
     progress_cb: ProgressCallback | None = None,
 ) -> tuple[list[dict], FetchReport]:
-    """Stage one: find the videos and their stats, and stop there.
+    """Find the videos to read, with their stats. No comments are fetched.
 
     The cheap half of a search: one search.list page per query (100 units) and
     a single batched videos.list for the whole result set (1 unit). No
@@ -630,7 +630,7 @@ def fetch_comments_for(
     include_replies: bool = True,
     progress_cb: ProgressCallback | None = None,
 ) -> tuple[list[dict], FetchReport]:
-    """Stage two: pull comments for videos the reader chose to keep.
+    """Pull the comments for a set of videos found by find_videos().
 
     Each video is read once even when several keywords matched it; a row is
     emitted per matching keyword, as before, and the sheet dedupes on

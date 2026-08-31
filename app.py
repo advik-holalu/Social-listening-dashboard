@@ -107,11 +107,6 @@ def _init_state() -> None:
     # Keywords searched in this session. The live report shows these and only
     # these; everything else in the Sheet is reachable as a CSV download.
     st.session_state.setdefault("session_keywords", [])
-    # Stage one's candidates, the ids still ticked, and the settings they were
-    # found with. Empty between searches.
-    st.session_state.setdefault("preview", [])
-    st.session_state.setdefault("preview_keep", set())
-    st.session_state.setdefault("preview_config", {})
     st.session_state.setdefault("fetch_error", "")
 
 
@@ -270,9 +265,8 @@ def _sidebar_details(
         rest = comment_cost(videos_per_keyword)
         st.caption(
             f"Estimated API cost: ~{upfront:,} units to search "
-            f"({queries} quer{'y' if queries == 1 else 'ies'}), then up to "
-            f"~{rest:,} more to fetch comments for every video found. Of "
-            "10,000 daily units; unticking videos lowers the second."
+            f"({queries} quer{'y' if queries == 1 else 'ies'}) plus up to "
+            f"~{rest:,} to read the comments, of 10,000 daily units."
         )
 
         if sheets_store.is_configured():
@@ -381,7 +375,7 @@ def _run_search(config: dict) -> None:
         status.markdown(f"{label}")
 
     try:
-        videos, report = youtube_fetcher.preview_videos(
+        videos, report = youtube_fetcher.find_videos(
             api_key=api_key,
             keywords=config["keywords"],
             max_videos=config["videos_per_keyword"],
@@ -406,123 +400,46 @@ def _run_search(config: dict) -> None:
         st.error(f"Search failed: {exc}")
         return
 
-    progress.empty()
-    status.empty()
-
-    # Stage one only. Nothing is fetched in bulk and nothing is written until
-    # the reader confirms the list below: an auto-saving search would otherwise
-    # commit a bad keyword match to the Sheet with no chance to catch it.
     st.session_state["last_report"] = report
-    st.session_state["preview"] = videos
-    st.session_state["preview_config"] = {
-        # What the rows will be filed under: the queries actually sent, which
-        # in All mode is the single joined string.
-        "keywords": youtube_fetcher.build_queries(
-            config["keywords"], config["match"]
-        ),
-        "include_replies": config["include_replies"],
-    }
-    st.session_state["preview_keep"] = {v["video_id"] for v in videos}
 
     if report.quota_exhausted:
         st.warning(
-            "The daily YouTube quota ran out mid-search. The list below is "
+            "The daily YouTube quota ran out mid-search. The results are "
             "partial - quota resets at midnight Pacific Time.",
         )
-    if not videos:
-        st.info("No videos matched. Try a different keyword.")
-
     if report.warnings:
         with st.expander(f"{len(report.warnings)} notice(s) from this search"):
             for warning in report.warnings:
                 st.write(f"- {warning}")
 
-
-def _preview_frame(videos: list[dict]) -> pd.DataFrame:
-    """The candidate list, as the editor wants it."""
-    keep = st.session_state["preview_keep"]
-    return pd.DataFrame([
-        {
-            "Fetch": video["video_id"] in keep,
-            "video_id": video["video_id"],
-            "Video": video.get("video_title", ""),
-            "Channel": video.get("channel_title", ""),
-            "Views": int(video.get("video_views", 0) or 0),
-            "Comments": int(video.get("video_comment_count", 0) or 0),
-            "Matched": ", ".join(video.get("keywords", [])),
-        }
-        for video in videos
-    ])
-
-
-def _preview_section() -> None:
-    """Stage one's result: choose which videos are worth reading.
-
-    A generic keyword pulls unrelated videos, and saving happens
-    automatically, so this is the one place to drop a bad match before its
-    comments reach the Sheet.
-    """
-    videos = st.session_state["preview"]
     if not videos:
+        progress.empty()
+        status.empty()
+        st.info("No videos matched. Try a different keyword.")
         return
 
-    st.subheader("Videos found")
-    st.caption(
-        f"{len(videos):,} video(s) from the search. Untick anything irrelevant, "
-        "then fetch the comments for the rest. Nothing has been saved yet."
-    )
-
-    edited = st.data_editor(
-        _preview_frame(videos),
-        width="stretch",
-        hide_index=True,
-        height=min(520, 90 + 36 * max(len(videos), 1)),
-        key="preview_editor",
-        column_config={
-            "Fetch": st.column_config.CheckboxColumn("Fetch", width="small"),
-            "video_id": None,
-            "Video": st.column_config.TextColumn("Video", width="large"),
-            "Channel": st.column_config.TextColumn("Channel", width="medium"),
-            "Views": st.column_config.NumberColumn("Views", format="%d"),
-            "Comments": st.column_config.NumberColumn("Comments", format="%d"),
-            "Matched": st.column_config.TextColumn("Matched keyword", width="small"),
+    # Straight on to the comments, reusing the same progress bar so the run
+    # reads as one continuous job rather than two.
+    _fetch_and_save(
+        videos,
+        {
+            # What the rows are filed under: the queries actually sent, which
+            # in All mode is the single joined string.
+            "keywords": youtube_fetcher.build_queries(
+                config["keywords"], config["match"]
+            ),
+            "include_replies": config["include_replies"],
         },
-        disabled=["video_id", "Video", "Channel", "Views", "Comments", "Matched"],
+        on_progress,
     )
 
-    chosen = {
-        str(row.video_id) for row in edited.itertuples() if bool(row.Fetch)
-    }
-    st.session_state["preview_keep"] = chosen
-
-    spent = search_cost(len(st.session_state["preview_config"]["keywords"]))
-    st.caption(
-        f"{len(chosen):,} of {len(videos):,} video(s) selected. Fetching their "
-        f"comments costs up to ~{comment_cost(len(chosen)):,} more quota "
-        f"units; the search itself has already cost ~{spent:,}."
-    )
-
-    if st.button(
-        "Fetch comments and save",
-        type="primary",
-        disabled=not chosen,
-        key="fetch_comments",
-    ):
-        _fetch_and_save([v for v in videos if v["video_id"] in chosen])
-        st.rerun()
+    progress.empty()
+    status.empty()
 
 
-def _fetch_and_save(videos: list[dict]) -> None:
-    """Stage two: pull comments for the chosen videos, then store them."""
+def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
+    """Pull the comments for every video the search found, then store them."""
     api_key = str(st.secrets.get("YOUTUBE_API_KEY", "")).strip()
-    config = st.session_state["preview_config"]
-
-    progress = st.progress(0.0)
-    status = st.empty()
-
-    def on_progress(current: int, total: int, label: str) -> None:
-        progress.progress(min(1.0, current / max(total, 1)))
-        status.markdown(label)
 
     try:
         rows, report = youtube_fetcher.fetch_comments_for(
@@ -535,9 +452,6 @@ def _fetch_and_save(videos: list[dict]) -> None:
     except (InvalidAPIKeyError, QuotaExceededError, YouTubeError) as exc:
         st.session_state["fetch_error"] = str(exc)
         return
-    finally:
-        progress.empty()
-        status.empty()
 
     added = _merge(rows)
     st.session_state["last_report"] = report
@@ -572,10 +486,6 @@ def _fetch_and_save(videos: list[dict]) -> None:
         "keywords": list(config["keywords"]),
         "ids": {str(row.get("comment_id", "")) for row in rows},
     }
-
-    # The candidates have served their purpose.
-    st.session_state["preview"] = []
-    st.session_state["preview_keep"] = set()
 
 
 def _run_summary() -> None:
@@ -1136,21 +1046,15 @@ def main() -> None:
         _past_searches()
 
     if config["run"]:
+        # A new search replaces what you were looking at, rather than piling
+        # onto the previous keyword's report.
+        st.session_state["last_run"] = None
+        st.session_state["session_keywords"] = []
         _run_search(config)
-        # Land on what was just searched instead of everything ever collected.
-        for keyword in config["keywords"]:
-            if keyword not in st.session_state["session_keywords"]:
-                st.session_state["session_keywords"].append(keyword)
 
-    # The second rule only earns its place when the run summary sits between
-    # the two; without it they just fence off an empty strip.
     if st.session_state["fetch_error"]:
         st.error(st.session_state["fetch_error"])
         st.session_state["fetch_error"] = ""
-
-    if st.session_state["preview"]:
-        _preview_section()
-        st.divider()
 
     if st.session_state["last_run"]:
         _run_summary()
