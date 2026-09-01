@@ -38,37 +38,11 @@ st.set_page_config(
 )
 
 # Fixed collection limits. These used to be sidebar sliders; they are pinned so
-# every run costs a predictable amount of quota.
-# Default and bounds for the videos-per-keyword control. The ceiling keeps a
-# single run inside a sane slice of the daily quota.
+# every run costs a predictable amount of the daily YouTube allowance.
 DEFAULT_VIDEOS_PER_KEYWORD = 20
 MIN_VIDEOS_PER_KEYWORD = 5
 MAX_VIDEOS_PER_KEYWORD = 50
 MAX_COMMENTS_PER_VIDEO = 500
-
-# Worst-case quota per keyword, derived from the fetcher's page sizes so the two
-# cannot drift: one search page (100 units) + one commentThreads page per 100
-# comments per video (1 unit each) + one batched videos.list call (1 unit).
-_COMMENT_PAGES_PER_VIDEO = -(-MAX_COMMENTS_PER_VIDEO // youtube_fetcher.MAX_COMMENT_PAGE)
-
-
-def search_cost(queries: int) -> int:
-    """Quota for the search step: one page per query plus one batched stats.
-
-    "All" mode is always one query however many terms it joins, so its search
-    cost does not grow with the keyword list.
-    """
-    return int(queries) * 100 + 1
-
-
-def comment_cost(videos: int) -> int:
-    """Quota to read comments for this many videos, at the 500 comment cap."""
-    return int(videos) * _COMMENT_PAGES_PER_VIDEO
-
-
-def quota_per_keyword(videos: int) -> int:
-    """Worst case for one keyword end to end, if every video is kept."""
-    return search_cost(1) + comment_cost(videos)
 
 # How the video sections are ordered on screen. Four of these are also YouTube
 # search orders; "Highest comments" is not -- the Data API has no comment-count
@@ -99,7 +73,6 @@ def _init_state() -> None:
     st.session_state.setdefault("last_refreshed", None)
     st.session_state.setdefault("loaded_from_sheet", False)
     st.session_state.setdefault("last_report", None)
-    st.session_state.setdefault("sheet_status", "")
     st.session_state.setdefault("insight_status", "")
     st.session_state.setdefault("last_run", None)
     st.session_state.setdefault("text_display", SHOW_BOTH)
@@ -108,6 +81,7 @@ def _init_state() -> None:
     # these; everything else in the Sheet is reachable as a CSV download.
     st.session_state.setdefault("session_keywords", [])
     st.session_state.setdefault("fetch_error", "")
+    st.session_state.setdefault("show_help", False)
 
 
 def _stamp_refresh() -> None:
@@ -147,10 +121,12 @@ def _load_history() -> None:
         with st.spinner("Loading saved comments..."):
             stored = _fetch_history()
         st.session_state["data"] = stored
-        st.session_state["sheet_status"] = f"Loaded {len(stored):,} saved comments."
         _stamp_refresh()
     except SheetsError as exc:
-        st.session_state["sheet_status"] = f"Sheets unavailable: {exc}"
+        _LOG.exception("Loading saved comments failed")
+        st.session_state["fetch_error"] = (
+            f"Could not load your saved comments: {exc}"
+        )
     finally:
         st.session_state["loaded_from_sheet"] = True
 
@@ -224,7 +200,7 @@ def _sidebar() -> dict:
     # reserved slot here and is filled once the history arrives.
     past_slot = st.sidebar.container()
 
-    _sidebar_details(keywords, options["videos_per_keyword"], match)
+    _help_section()
 
     return {
         "keywords": keywords, "run": run, "past_slot": past_slot,
@@ -232,52 +208,327 @@ def _sidebar() -> dict:
     }
 
 
-def _sidebar_details(
-    keywords: list[str], videos_per_keyword: int, match: str
-) -> None:
-    """Housekeeping that matters when something looks wrong, and not before.
+# The manual is a page of its own, not a dialog: it is long enough to read
+# properly, and a reader who wants to check one thing mid-search can go and
+# come back with the Back button rather than losing a modal behind a click.
+#
+# It is laid out as cards across the full width. One narrow column of prose
+# down the middle of a wide monitor wastes most of the screen and turns a
+# five minute read into a long scroll.
+def _help_back(key: str, kind: str = "secondary") -> None:
+    if st.button(
+        "Back to the app",
+        icon=":material/arrow_back:",
+        key=key,
+        type=kind,
+    ):
+        st.session_state["show_help"] = False
+        st.rerun()
 
-    Everything here is a caption rather than a warning or metric: small, muted,
-    and at the very bottom, so the sidebar reads as one input and one button.
-    """
+
+def _help_card(column, title: str, body: str) -> None:
+    """One titled card. Cards in a row stretch to a common height."""
+    with column:
+        with st.container(border=True, height="stretch"):
+            st.subheader(title)
+            st.markdown(body)
+
+
+def _help_page() -> None:
+    """The user manual. Plain language, no jargon, nothing about the plumbing."""
+    # The way out sits top left, where a back control belongs, and carries the
+    # same weight as the one at the end of the page.
+    _help_back("help_back_top", "primary")
+
+    st.title("How it works")
+    st.caption(
+        "A guide to everything in this tool. It takes about five minutes to "
+        "read, and you only need to read it once."
+    )
+
+    st.divider()
+
+    # ---- what it is, and the four steps --------------------------------
+    left, right = st.columns(2, gap="medium")
+    _help_card(
+        left,
+        "What this tool is for",
+        "People talk about brands and products in YouTube comments all day "
+        "long, spread across hundreds of videos. Reading that by hand is "
+        "impossible.\n\n"
+        "This tool searches YouTube for you, collects the comments from the "
+        "videos it finds, and puts them all in one place you can read, filter "
+        "and download. You can use it on your own brand, on a competitor, on "
+        "a product category, or on anything else people might be talking "
+        "about.",
+    )
+    _help_card(
+        right,
+        "A search in four steps",
+        "1. Type what you want to search for in the sidebar on the left.\n"
+        "2. Choose whether your keywords should be searched separately or "
+        "together.\n"
+        "3. Press **Run Search** and wait. It usually takes under a minute.\n"
+        "4. Read the results. They are saved for you automatically.\n\n"
+        ":gray[Everything else on this page is detail. If you only remember "
+        "these four steps, you can use the tool.]",
+    )
+
+    st.header("Setting up a search", anchor="setting-up")
+    left, right = st.columns(2, gap="medium")
+    _help_card(
+        left,
+        "Choosing your keywords",
+        "The box at the top of the sidebar is where you say what to look "
+        "for.\n\n"
+        "**Separate keywords with commas.** Spaces are part of a keyword, not "
+        "a separator. So `Sweet Karam Coffee, SKC, Mysore pak` is three "
+        "keywords, not five.\n\n"
+        "**Capital letters do not matter.** YouTube treats `imli pop` and "
+        "`Imli Pop` the same way.\n\n"
+        "**Think about what real people type.** They shorten names, they "
+        "misspell them, and they use nicknames. Adding those as extra "
+        "keywords finds comments you would otherwise miss.",
+    )
+    _help_card(
+        right,
+        "Match any of these, or match all together",
+        "This choice changes what gets searched, and it makes the biggest "
+        "difference to your results.\n\n"
+        f"**{MATCH_ANY_LABEL}** runs a separate search for each keyword and "
+        "pools the results. With `GO DESi, imli pop, imly pop` you get videos "
+        "for each of the three, whichever way people spell it. Use this when "
+        "you are not sure what people call the thing.\n\n"
+        f"**{MATCH_ALL_LABEL}** joins your keywords into one search, as "
+        "though you typed them all into YouTube at once. `GO DESi imli pop` "
+        "finds videos about that specific thing and skips everything that "
+        "only matches one word.\n\n"
+        "If a search brings back a lot of things that have nothing to do with "
+        "you, switch to matching all together. If it brings back almost "
+        "nothing, switch to matching any.",
+    )
+
+    st.subheader("The rest of the settings", anchor="settings")
+    one, two, three, four = st.columns(4, gap="medium")
+    _help_card(
+        one,
+        "Sort videos by",
+        "Decides which videos are picked, and the order they appear in.\n\n"
+        "- **Most relevant** is YouTube's own idea of the best match, and a "
+        "good default.\n"
+        "- **Newest first** is for launches and campaigns.\n"
+        "- **Most viewed** finds the videos the most people have seen.\n"
+        "- **Highest rated** finds the best liked videos.\n"
+        "- **Highest comments** puts the busiest comment sections first, "
+        "which is usually where the conversation is.",
+    )
+    _help_card(
+        two,
+        "Videos to query",
+        "How many videos the search reads comments from, in total. Not per "
+        "keyword. If you ask for 20 videos with four keywords, the four share "
+        "those 20 between them.\n\n"
+        "Twenty is a sensible default. Raise it when a topic is busy and you "
+        "want more ground covered. More videos takes longer.",
+    )
+    _help_card(
+        three,
+        "From the last N days",
+        "Only looks at videos published in that window. It starts at 365 "
+        "days, which is a year. Set it to 0 to search everything ever "
+        "posted.\n\n"
+        "This is the age of the **video**, not of the comment. A video from "
+        "ten months ago can still be collecting comments today, and you will "
+        "get those.",
+    )
+    _help_card(
+        four,
+        "Include replies",
+        "On by default. Replies are where people argue, correct each other "
+        "and answer questions, so they are usually worth having.\n\n"
+        "Turn it off if you only want top level comments.",
+    )
+
+    st.header("Reading what comes back", anchor="reading")
+    left, right = st.columns(2, gap="medium")
+    _help_card(
+        left,
+        "What happens when you press Run Search",
+        "The tool finds the videos first, then reads the comments on each "
+        "one. A progress bar tells you where it has got to. Leave the tab "
+        "open while it runs.\n\n"
+        "When it finishes you get three numbers:\n\n"
+        "- **Comments collected** is how many comments this search brought "
+        "back.\n"
+        "- **Newly saved** is how many of those were new. Search the same "
+        "thing twice and this number will be smaller the second time, "
+        "because the same comment is never stored twice.\n"
+        "- **Videos** is how many videos those comments came from.\n\n"
+        "A new search replaces the one on screen. The old one is not lost. It "
+        "stays in **Past searches** in the sidebar, ready to download.",
+    )
+    _help_card(
+        right,
+        "Videos and Shorts",
+        f"Above the results is a filter for **{ALL_TYPES}**, "
+        f"**{SHORTS_ONLY}** and **{VIDEOS_ONLY}**.\n\n"
+        "Shorts are the vertical clips under a minute. They pull a different "
+        "crowd and a different tone from long videos, so it is worth looking "
+        "at each on its own before you draw a conclusion.",
+    )
+
+    left, right = st.columns(2, gap="medium")
+    _help_card(
+        left,
+        BY_VIDEO_VIEW,
+        "Groups the comments under the video they came from. Each video is a "
+        "section you can open, showing how many comments it has and a link to "
+        "watch it on YouTube.\n\n"
+        "This is the view for understanding **why** people are saying "
+        "something. A run of complaints makes a lot more sense once you can "
+        "see the video that prompted them.\n\n"
+        "Use the **Videos to show** control at the top to load more sections.",
+    )
+    _help_card(
+        right,
+        ALL_COMMENTS_VIEW,
+        "Puts every comment in one big table, whatever video it came "
+        "from.\n\n"
+        "This is the view for scanning quickly, sorting, and downloading. "
+        "Sort it with the **Sort comments by** buttons, or click any column "
+        "header in the table.\n\n"
+        "The small toolbar at the top right of the table lets you search "
+        "inside it and make it full screen.",
+    )
+
+    st.header("Working with your results", anchor="working")
+    one, two, three = st.columns(3, gap="medium")
+    _help_card(
+        one,
+        "Comments in other languages",
+        "Plenty of comments come in Hindi, Tamil, Telugu, Kannada, Bengali "
+        "and Marathi, and plenty more in those languages typed out in English "
+        "letters.\n\n"
+        "The tool spots those and offers a **Translate** button. In the "
+        "report by video it translates a whole video's comments at once. In "
+        "the table you can tick the rows you want and translate only "
+        "those.\n\n"
+        "A comment is only translated once. After that the English is kept "
+        "with it, for you and for everyone else.\n\n"
+        "Once something has been translated you get a **Comment text** "
+        "choice: the original, the English, or both side by side.",
+    )
+    _help_card(
+        two,
+        "Finding something specific",
+        "The **Search comments** box above the results filters what you have "
+        "already collected. It does not go back to YouTube for more.\n\n"
+        "Type a word or a phrase and you get only the comments containing it. "
+        "It looks at the English translations as well as the original text, "
+        "so searching for `expensive` also finds a comment that said it in "
+        "Hindi.\n\n"
+        "It is the fastest way to answer a specific question. Search `price` "
+        "to see who is complaining about cost, or a flavour name to see what "
+        "people think of it. Clear the box to get everything back.",
+    )
+    _help_card(
+        three,
+        "Downloading",
+        "At the bottom of the results is a button to download what you are "
+        "looking at as a CSV file, which opens in Excel. It includes every "
+        "column, even the ones the table on screen does not show.\n\n"
+        "Whatever you have filtered is what you get. Filter to Shorts and "
+        "search for a word, and the download has exactly those comments in "
+        "it.",
+    )
+
+    left, right = st.columns(2, gap="medium")
+    _help_card(
+        left,
+        "Saving and past searches",
+        "You never have to save anything. Every search is stored the moment "
+        "it finishes.\n\n"
+        "**Past searches** in the sidebar lists everything anyone has "
+        "searched before, with the number of comments held for each one. "
+        "Click any of them to download it as a CSV file. That is how you get "
+        "back to a search from last week, or one a colleague ran.\n\n"
+        "The **Reload saved results** button at the very bottom of the page "
+        "fetches the latest stored comments. Press it if someone else has "
+        "been running searches while you had the tab open.",
+    )
+    _help_card(
+        right,
+        "Tips for a good search",
+        "- **Start wide, then narrow.** Search the brand name on its own "
+        "first to see what is out there, then add keywords to focus.\n"
+        "- **Search how people talk, not how the pack is printed.** "
+        "Nicknames and misspellings find real conversations.\n"
+        "- **Sort by Highest comments** when you want opinions. A video with "
+        "500 comments tells you more than ten videos with 3.\n"
+        "- **Look at Shorts separately.** The audience and the tone are "
+        "usually not the same.\n"
+        "- **Search your competitors too.** The complaints under their videos "
+        "are the openings for you.",
+    )
+
+    st.header("If something looks wrong", anchor="troubleshooting")
+    one, two, three = st.columns(3, gap="medium")
+    _help_card(
+        one,
+        "No videos matched",
+        "Your keywords may be too specific together. Try matching any of them "
+        "instead of all together, use fewer words, or widen the number of "
+        "days.",
+    )
+    _help_card(
+        two,
+        "A message about YouTube stopping for today",
+        "There is a daily limit on how much can be collected, shared by "
+        "everyone using the tool. Anything already collected is saved, and "
+        "the limit clears overnight.",
+    )
+    _help_card(
+        three,
+        "A video you expected is missing",
+        "The tool only reads the videos your settings asked for. Raise Videos "
+        "to query, or change how they are sorted.",
+    )
+
+    one, two = st.columns(2, gap="medium")
+    _help_card(
+        one,
+        "Fewer comments than YouTube shows",
+        "Some channels turn comments off, and some comments get deleted. Very "
+        "busy videos are read up to a limit rather than to the last comment.",
+    )
+    _help_card(
+        two,
+        "Something else",
+        "Take a screenshot of the message and send it to whoever set the tool "
+        "up for you.",
+    )
+
+    st.divider()
+    _help_back("help_back_bottom", "primary")
+
+
+def _help_section() -> None:
+    """The way into the help, at the bottom of the sidebar."""
     st.sidebar.divider()
-    with st.sidebar.expander("Details", expanded=False):
-        stamp = st.session_state["last_refreshed"]
-        st.caption(
-            "Last refreshed: "
-            + (stamp.strftime("%d %b %Y, %H:%M:%S") if stamp else "never")
+    if st.sidebar.button(
+        "How it works",
+        icon=":material/help:",
+        use_container_width=True,
+        key="how_it_works",
+    ):
+        st.session_state["show_help"] = True
+        st.rerun()
+
+    if not sheets_store.is_configured():
+        st.sidebar.caption(
+            "Results are not being saved right now, so they will be gone when "
+            "you close this tab."
         )
-
-        if st.session_state["sheet_status"]:
-            st.caption(st.session_state["sheet_status"])
-
-        queries = len(youtube_fetcher.build_queries(keywords, match))
-        st.caption(
-            f"Up to {videos_per_keyword} videos in total for this search, "
-            f"shared across the terms, and {MAX_COMMENTS_PER_VIDEO} comments "
-            "per video."
-        )
-
-        # Two stages, so two numbers: the search runs on Run Search, the
-        # comments only for videos still ticked afterwards. "All" is one
-        # query, so its search cost is flat.
-        upfront = search_cost(queries)
-        rest = comment_cost(videos_per_keyword)
-        st.caption(
-            f"Estimated API cost: ~{upfront:,} units to search "
-            f"({queries} quer{'y' if queries == 1 else 'ies'}) plus up to "
-            f"~{rest:,} to read the comments, of 10,000 daily units."
-        )
-
-        if sheets_store.is_configured():
-            url = sheets_store.sheet_url()
-            if url:
-                st.caption(f"[Open the Google Sheet]({url})")
-        else:
-            st.caption(
-                "Google Sheets is not connected, so results live only in this "
-                "session. See `.streamlit/secrets.toml.example`."
-            )
 
 
 # --------------------------------------------------------------------------
@@ -313,8 +564,8 @@ def _search_options() -> dict:
         step=5,
         key="opt_videos",
         help=(
-            "How many videos each keyword pulls comments from. More videos "
-            "means more quota: the estimate is in Details below."
+            "How many videos this search reads comments from in total, "
+            "shared across your keywords. More videos takes longer."
         ),
     )
     days_back = st.sidebar.number_input(
@@ -404,8 +655,8 @@ def _run_search(config: dict) -> None:
 
     if report.quota_exhausted:
         st.warning(
-            "The daily YouTube quota ran out mid-search. The results are "
-            "partial - quota resets at midnight Pacific Time.",
+            "YouTube stopped returning results part way through, so this is "
+            "only some of what is out there. Try again tomorrow."
         )
     if report.warnings:
         with st.expander(f"{len(report.warnings)} notice(s) from this search"):
@@ -460,16 +711,11 @@ def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
     written = 0
     if rows and sheets_store.is_configured():
         try:
-            with st.spinner("Saving to Google Sheets..."):
-                written, already = sheets_store.append_rows(rows)
-            st.session_state["sheet_status"] = (
-                f"Saved {written:,} new comment(s) to Sheets "
-                f"({already:,} were already there)."
-            )
+            with st.spinner("Saving your results..."):
+                written, _already = sheets_store.append_rows(rows)
             _fetch_history.clear()
         except SheetsError as exc:
             _LOG.exception("Saving the search failed")
-            st.session_state["sheet_status"] = f"Could not save to Sheets: {exc}"
             st.session_state["fetch_error"] = (
                 f"The comments were fetched but could not be saved: {exc}"
             )
@@ -500,7 +746,7 @@ def _run_summary() -> None:
 
     one, two, three = st.columns(3)
     one.metric("Comments collected", f"{last['comments']:,}")
-    two.metric("New to your sheet", f"{last.get('written', 0):,}")
+    two.metric("Newly saved", f"{last.get('written', 0):,}")
     three.metric("Videos", f"{last['videos']:,}")
 
 
@@ -1027,6 +1273,12 @@ def _drilldown(df: pd.DataFrame, order_label: str) -> None:
 def main() -> None:
     _init_state()
 
+    # The manual takes the whole page, sidebar included, so nothing competes
+    # with it and nobody starts a search by accident while reading.
+    if st.session_state["show_help"]:
+        _help_page()
+        return
+
     # Everything above the results draws before the Sheet is touched. Streamlit
     # streams each element to the browser as the script runs, so the title, the
     # sidebar and the search box are on screen and usable while the fetch below
@@ -1112,7 +1364,7 @@ def main() -> None:
     )
 
     if sheets_store.is_configured():
-        if st.button("Reload from Google Sheets"):
+        if st.button("Reload saved results"):
             st.session_state["loaded_from_sheet"] = False
             st.rerun()
 

@@ -156,9 +156,10 @@ def _raise_if_fatal(error: HttpError) -> None:
     _LOG.error("YouTube API error: %s", detail)
 
     if reason in ("quotaExceeded", "rateLimitExceeded"):
+        # The detail stays in the log, not in the sentence the user reads.
         raise QuotaExceededError(
-            "YouTube API daily quota exhausted. Results below are partial - "
-            f"quota resets at midnight Pacific Time. ({detail})"
+            "YouTube has stopped returning results for today. Anything "
+            "collected so far is saved. Try again tomorrow."
         ) from error
 
     # Only blame the key when YouTube blamed the key.

@@ -38,10 +38,10 @@ streamlit run app.py
 ## Using it
 
 The sidebar holds the whole search: what to look for, how to collect it
-(**Which videos** and **What to collect**), and the **Run Search** button.
-Housekeeping - last refresh time, the quota estimate, the link to the Google
-Sheet - sits in a collapsed **Details** box at the bottom of it. The main area
-is only results.
+(**Which videos** and **What to collect**), and the **Run Search** button. A
+**How it works** button at the bottom opens the user manual, which takes over
+the whole page, sidebar included, and comes back with a **Back to the app**
+button. The main area is otherwise only results.
 
 The main area has two views, switched with the toggle above the list:
 
@@ -138,11 +138,13 @@ the terms take turns filling the cap, so a term with few results does not waste
 its share and a busy term cannot crowd the others out. A video found by two
 terms is listed once, carrying both.
 
-Cost has two parts. Searching is **100 units per query plus 1** for a single
-batched stats call: three terms matched any is 301, while matching all together
-is 101 however many terms it joins. Reading comments is **5 units per video**,
-so the ceiling follows Videos to query. The Details box in the sidebar shows
-both figures before you run. Quota resets at midnight Pacific Time.
+Cost, for whoever owns the API key: searching is 100 units per query plus 1 for
+a single batched stats call, so three terms matched any is 301 while matching
+all together is 101 however many terms it joins. Reading comments is 5 units per
+video, so the ceiling follows Videos to query, out of 10,000 a day that reset at
+midnight Pacific Time. None of this is shown in the app - it is not the end
+user's problem, and the user-facing message when the day's allowance runs out
+says only that YouTube has stopped returning results.
 
 ## Startup
 

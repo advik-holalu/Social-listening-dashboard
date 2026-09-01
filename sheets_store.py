@@ -408,8 +408,3 @@ def update_analysis(df: pd.DataFrame) -> int:
 
     return len(touched)
 
-
-def sheet_url() -> str:
-    """Direct link to the configured Sheet, for a 'view in Sheets' link in the UI."""
-    key = str(st.secrets.get(SECRET_SHEET_KEY, "")).strip()
-    return f"https://docs.google.com/spreadsheets/d/{key}/edit" if key else ""
