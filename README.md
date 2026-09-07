@@ -1,7 +1,7 @@
 # Social Listening - YouTube (GO DESi)
 
 Search YouTube by keyword, pull video stats and comments, store them in a Google
-Sheet, and read them back as two reports, with on-demand Claude translation for
+Sheet, and read them back as two reports, with on-demand translation for
 non-English comments.
 
 ## Setup
@@ -23,7 +23,7 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 | `SHEET_KEY` | The long id in your Sheet URL: `docs.google.com/spreadsheets/d/`**`<SHEET_KEY>`**`/edit` |
 | `WORKSHEET_NAME` | Tab name, defaults to `comments`. Created automatically if missing |
 | `[gcp_service_account]` | Every field from the service account JSON key file |
-| `ANTHROPIC_API_KEY` | console.anthropic.com -> API keys. Needed for translation |
+
 
 **The step people miss:** after creating the service account, open the Google
 Sheet and share it with the `client_email` from the JSON, with **Editor** access.
@@ -84,6 +84,28 @@ and the app says how many rather than dropping them silently.
 
 ## Searching
 
+The keyword box and **Run Search** sit in one small form, so pressing Enter in
+the box runs the search exactly as clicking the button does. A bare text input
+only commits its value on Enter, and the run hung off the button, so the
+keystroke did nothing. Everything below the button stays outside the form and
+applies as soon as you change it.
+
+Search results are then held to a stricter test than YouTube's own. A video is
+kept only when the keywords really appear in its title or description, matched
+case-insensitively as a substring with runs of whitespace collapsed, so a term
+typed with one space still matches a title that wrapped across a line. The Match
+mode decides how many have to appear: **any** keeps a video that carries at
+least one term, **all together** requires every one of them. `FetchReport`
+counts the drops in `videos_irrelevant` and the run summary reports them.
+
+**Exclude keywords** sits under the search box and is parsed the same way, on
+commas. A video is dropped when its title or its full description contains any
+of those terms, matched case-insensitively as a substring, so `recipe` also
+catches `Recipes`. The drop happens after the batched stats call, which is
+where the full description arrives, and before any comments are read, so an
+excluded video costs nothing beyond the search that found it. The run summary
+says how many were skipped.
+
 **Run Search** is the whole job in one click. It finds the videos (one
 `search.list` page per keyword plus one batched `videos.list` for their stats),
 reads the comments on every video it found, and saves them. The progress bar
@@ -111,7 +133,7 @@ Translations write onto rows the Sheet already holds and skip anything else.
 | `app.py` | Streamlit UI - sidebar plus the single per-video drilldown |
 | `youtube_fetcher.py` | `search_videos()`, `get_video_stats()`, `get_comments()`, `run_search()` |
 | `sheets_store.py` | gspread read/write, dedupe on `comment_id`, translation write-back |
-| `insights.py` | Claude translation: language detection, batching, caching |
+| `insights.py` | Translation: language detection, batching, caching |
 
 ## API quota
 
@@ -146,6 +168,43 @@ midnight Pacific Time. None of this is shown in the app - it is not the end
 user's problem, and the user-facing message when the day's allowance runs out
 says only that YouTube has stopped returning results.
 
+## Region
+
+Every `search.list` call carries `regionCode`, set by `DEFAULT_REGION_CODE` in
+`youtube_fetcher.py`, which is `IN`. Generic brand names collide badly without
+it: "candyman" returns a Jamaican rapper long before the Indian sweet. It is a
+bias applied to relevance, not a hard filter, so a genuinely relevant video from
+elsewhere still comes back, and comments in any language are still collected.
+
+Change that one constant for another country, or pass `region_code=None` to a
+search to send no preference at all.
+
+## Retention
+
+The Sheet keeps the `KEYWORD_LIMIT` (20) most recently searched keywords. After
+every search that saves, anything past that is deleted permanently: the rows go
+from the comments tab, and there is no archive.
+
+Recency is the last-searched date, not the first. A `searches` tab holds one row
+per keyword with a timestamp, refreshed on every run whether or not that run
+wrote any new comments. That tab is why a repeat search protects a keyword: a
+second search of an old keyword usually finds nothing new to write, so the
+newest `fetched_at` in the comments would still say weeks ago, and the keyword
+could be deleted minutes after someone searched it. Keywords collected before
+that tab existed fall back to their newest `fetched_at`.
+
+Every deletion is logged at WARNING before it happens, naming the keyword, its
+last-searched date and its row count, followed by a total. That log is the only
+record left once the rows are gone.
+
+Rows are deleted in contiguous blocks from the bottom of the Sheet up, so
+earlier deletions cannot shift the rows still queued. The cleanup runs in its
+own try block after the save: the comments are already stored by then, so a
+failure here is logged and never reported as a failed save.
+
+**Past searches** needs no rule of its own. It lists what the Sheet holds, and
+the Sheet now genuinely holds 20 keywords.
+
 ## Startup
 
 The page draws before the Sheet is touched: title, sidebar and search box are
@@ -169,12 +228,31 @@ existing id column from the Sheet and only appends ids it hasn't seen - so
 re-running the same search adds nothing, and overlapping keywords don't
 double-count a comment.
 
-## Claude usage
-
-**Translation only**, and only when someone presses a Translate button. Nothing
-else in the app calls Claude.
-
 ## Translation
+
+Translation is Google Cloud Translation, authenticated with the **same service
+account as the Sheet**, so there is no second key in `secrets.toml`. That
+account needs the Cloud Translation API enabled on its project and the Cloud
+Translation API User role. Nothing in the app calls an LLM.
+
+Billing is per character, against a 500,000 character monthly free tier. Only
+comments someone asks for are sent, clipped at 2,000 characters each, and a
+comment is translated once and then read from the Sheet forever after, so real
+usage sits far inside the free tier.
+
+Comments are sent with the source language auto-detected, with one exception.
+Hinglish, meaning an Indian language typed in Latin letters, is detected as
+English and handed straight back untranslated, so anything the marker-word
+heuristic reads as Hinglish is sent with the source declared as Hindi instead.
+That costs one extra call per batch and only when such comments are present.
+
+Each video section in **Report by video** is a keyed expander, its open state
+held in `st.session_state` under `video_open_<video_id>`. Translating reruns the
+script, and without a key the section the reader was inside collapsed, leaving
+them to find it and open it again. Both translate routes set that key before
+their rerun, so the section they were working in is still open, with the
+translation in place, when the page comes back. Streamlit owns the scroll
+position; what this controls is that nothing has to be reopened.
 
 Translation is on demand, by either of two routes that share one code path
 (`_translate_ids`), so whichever runs first the other finds nothing left to do:

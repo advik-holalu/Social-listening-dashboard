@@ -10,6 +10,8 @@ key, and an append-only write path that filters out ids the sheet already has.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
+import re
 from typing import Sequence
 
 import gspread
@@ -21,7 +23,7 @@ from gspread.exceptions import APIError, SpreadsheetNotFound, WorksheetNotFound
 from insights import TAG_COLUMNS
 from youtube_fetcher import COLUMNS, ID_COLUMN
 
-# The sheet carries the fetched columns plus everything Claude writes back --
+# The sheet carries the fetched columns plus the translation columns --
 # the sentiment tags and the translation. Those go last so a sheet written
 # before they existed can be widened in place.
 SHEET_COLUMNS: list[str] = COLUMNS + TAG_COLUMNS
@@ -37,6 +39,21 @@ SECRET_SERVICE_ACCOUNT = "gcp_service_account"
 SECRET_SHEET_KEY = "SHEET_KEY"
 SECRET_WORKSHEET = "WORKSHEET_NAME"
 DEFAULT_WORKSHEET = "comments"
+
+# One row per keyword, holding when it was last searched. It exists because a
+# repeat search often writes no new comments (the same ids come back and are
+# skipped), and the retention rule below has to treat that keyword as fresh
+# all the same. Without this the newest fetched_at in the comments would say
+# it was last seen weeks ago and retention could delete it minutes after
+# someone searched it.
+SEARCH_LOG_WORKSHEET = "searches"
+SEARCH_LOG_COLUMNS: list[str] = ["keyword", "last_searched"]
+
+# How many distinct keywords the Sheet keeps. Everything older than the most
+# recent 20, by last-searched date, is deleted for good.
+KEYWORD_LIMIT = 20
+
+_LOG = logging.getLogger(__name__)
 
 
 # Columns that should come back as numbers, not strings, after a round-trip
@@ -156,6 +173,32 @@ def _get_worksheet_cached(sheet_key: str, worksheet_name: str) -> gspread.Worksh
 
     _widen_header(worksheet, header)
     return worksheet
+
+
+@st.cache_resource(show_spinner=False)
+def _named_worksheet_cached(
+    sheet_key: str, name: str, columns: tuple[str, ...]
+) -> gspread.Worksheet:
+    spreadsheet = _get_spreadsheet(sheet_key)
+    try:
+        worksheet = spreadsheet.worksheet(name)
+    except WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=name, rows=1000, cols=max(len(columns), 1)
+        )
+        worksheet.update(range_name="A1", values=[list(columns)])
+        return worksheet
+
+    if not worksheet.row_values(1):
+        worksheet.update(range_name="A1", values=[list(columns)])
+    return worksheet
+
+
+def _search_log() -> gspread.Worksheet:
+    """The keyword tab, created with its header the first time it is needed."""
+    return _named_worksheet_cached(
+        _sheet_key(), SEARCH_LOG_WORKSHEET, tuple(SEARCH_LOG_COLUMNS)
+    )
 
 
 def _get_worksheet() -> gspread.Worksheet:
@@ -345,7 +388,7 @@ def _cell(value: object) -> str | int | float:
 
 
 def update_analysis(df: pd.DataFrame) -> int:
-    """Write the Claude tags back onto rows that already exist in the Sheet.
+    """Write the translations back onto rows that already exist in the Sheet.
 
     Matches on comment_id and writes only the analysis columns, so a concurrent
     fetch appending new rows cannot be clobbered. Returns the number of rows
@@ -408,3 +451,217 @@ def update_analysis(df: pd.DataFrame) -> int:
 
     return len(touched)
 
+
+
+# --------------------------------------------------------------------------
+# Retention: the Sheet keeps the most recently searched KEYWORD_LIMIT keywords
+# --------------------------------------------------------------------------
+# Everything past that is deleted permanently. There is no archive and no undo,
+# so every deletion is logged first: which keyword, when it was last searched,
+# and how many rows went with it.
+def record_search(keywords: Sequence[str]) -> None:
+    """Stamp these keywords as searched now.
+
+    Called on every run, whether or not it wrote any comments, so that
+    re-running an old keyword makes it recent again.
+    """
+    wanted = [str(k).strip() for k in keywords if str(k).strip()]
+    if not wanted:
+        return
+
+    worksheet = _search_log()
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        values = worksheet.get_all_values()
+    except APIError as exc:
+        raise SheetsError(f"Could not read the keyword list: {exc}") from exc
+
+    # Row number of each keyword already logged, so a repeat updates in place
+    # rather than growing a second entry.
+    rows_by_keyword = {
+        str(row[0]).strip(): number
+        for number, row in enumerate(values[1:], start=2)
+        if row and str(row[0]).strip()
+    }
+
+    updates = []
+    appends = []
+    for keyword in dict.fromkeys(wanted):
+        number = rows_by_keyword.get(keyword)
+        if number:
+            updates.append({"range": f"B{number}", "values": [[stamp]]})
+        else:
+            appends.append([keyword, stamp])
+
+    try:
+        if updates:
+            worksheet.batch_update(updates, value_input_option="RAW")
+        if appends:
+            worksheet.append_rows(appends, value_input_option="RAW")
+    except APIError as exc:
+        raise SheetsError(f"Could not update the keyword list: {exc}") from exc
+
+
+# A date we can trust looks like 2026-09-07. Anything else is treated as no
+# date at all: some old rows carry junk in fetched_at from a column shift, and
+# as plain text "97" sorts above "2026-09-07", which would let a corrupted row
+# pose as the most recent search and push a real one out.
+_DATE_LIKE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _as_date(value: object) -> str:
+    text = str(value or "").strip()
+    return text if _DATE_LIKE.match(text) else ""
+
+
+def _search_log_map() -> dict[str, str]:
+    """keyword -> when it was last searched, from the keyword tab."""
+    try:
+        values = _search_log().get_all_values()
+    except APIError as exc:
+        raise SheetsError(f"Could not read the keyword list: {exc}") from exc
+
+    seen: dict[str, str] = {}
+    for row in values[1:]:
+        if not row or not str(row[0]).strip():
+            continue
+        keyword = str(row[0]).strip()
+        stamp = _as_date(row[1]) if len(row) > 1 else ""
+        # Keep the latest if the tab somehow holds a keyword twice.
+        if stamp >= seen.get(keyword, ""):
+            seen[keyword] = stamp
+    return seen
+
+
+def _contiguous(numbers: Sequence[int]) -> list[tuple[int, int]]:
+    """Sorted row numbers to (first, last) runs, so deletes go out in blocks."""
+    runs: list[tuple[int, int]] = []
+    for number in sorted(numbers):
+        if runs and number == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], number)
+        else:
+            runs.append((number, number))
+    return runs
+
+
+def apply_retention(limit: int = KEYWORD_LIMIT) -> dict[str, int]:
+    """Delete every keyword beyond the `limit` most recently searched.
+
+    Returns {keyword: rows deleted}, empty when there was nothing to do. The
+    deletion is permanent: rows are removed from the Sheet, not moved.
+    """
+    worksheet = _get_worksheet()
+    try:
+        values = worksheet.get_all_values()
+    except APIError as exc:
+        raise SheetsError(f"Could not read the Sheet for cleanup: {exc}") from exc
+
+    if len(values) < 2:
+        return {}
+
+    header = [str(name).strip() for name in values[0]]
+    try:
+        keyword_at = header.index("keyword")
+    except ValueError:
+        _LOG.error("Retention skipped: no keyword column in the Sheet header")
+        return {}
+    fetched_at = header.index("fetched_at") if "fetched_at" in header else None
+
+    rows_by_keyword: dict[str, list[int]] = {}
+    newest_row: dict[str, str] = {}
+    for number, row in enumerate(values[1:], start=2):
+        if len(row) <= keyword_at:
+            continue
+        keyword = str(row[keyword_at]).strip()
+        if not keyword:
+            continue
+        rows_by_keyword.setdefault(keyword, []).append(number)
+        if fetched_at is not None and len(row) > fetched_at:
+            stamp = _as_date(row[fetched_at])
+            if stamp > newest_row.get(keyword, ""):
+                newest_row[keyword] = stamp
+
+    if len(rows_by_keyword) <= limit:
+        return {}
+
+    # The keyword tab is the authority on when something was last searched.
+    # Anything it has never heard of falls back to its newest comment, which
+    # covers everything collected before this tab existed.
+    try:
+        logged = _search_log_map()
+    except SheetsError as exc:
+        _LOG.warning("Retention: keyword list unreadable (%s), using comment dates", exc)
+        logged = {}
+
+    def last_searched(keyword: str) -> str:
+        return logged.get(keyword) or newest_row.get(keyword, "")
+
+    ranked = sorted(
+        rows_by_keyword,
+        key=lambda keyword: (last_searched(keyword), keyword),
+        reverse=True,
+    )
+    undated = [k for k in rows_by_keyword if not last_searched(k)]
+    if undated:
+        _LOG.warning(
+            "Retention: %d keyword(s) carry no usable date and rank oldest: "
+            "%s. Search one again to protect it.",
+            len(undated),
+            ", ".join(sorted(undated)),
+        )
+
+    doomed = ranked[limit:]
+    if not doomed:
+        return {}
+
+    deleted: dict[str, int] = {}
+    for keyword in doomed:
+        numbers = rows_by_keyword[keyword]
+        _LOG.warning(
+            "Retention: deleting keyword %r (last searched %s), %d row(s). "
+            "This is permanent.",
+            keyword,
+            last_searched(keyword) or "unknown",
+            len(numbers),
+        )
+        deleted[keyword] = len(numbers)
+
+    # Bottom up, so earlier deletions cannot shift the rows still to go.
+    doomed_rows = [number for keyword in doomed for number in rows_by_keyword[keyword]]
+    try:
+        for first, last in reversed(_contiguous(doomed_rows)):
+            worksheet.delete_rows(first, last)
+    except APIError as exc:
+        raise SheetsError(f"Could not delete old rows: {exc}") from exc
+
+    _drop_from_search_log(doomed)
+
+    total = sum(deleted.values())
+    _LOG.warning(
+        "Retention: removed %d keyword(s) and %d row(s); %d keyword(s) kept.",
+        len(deleted),
+        total,
+        limit,
+    )
+    return deleted
+
+
+def _drop_from_search_log(keywords: Sequence[str]) -> None:
+    """Forget deleted keywords, so the tab matches what the Sheet holds."""
+    gone = {str(k).strip() for k in keywords}
+    if not gone:
+        return
+    try:
+        worksheet = _search_log()
+        values = worksheet.get_all_values()
+        numbers = [
+            number
+            for number, row in enumerate(values[1:], start=2)
+            if row and str(row[0]).strip() in gone
+        ]
+        for first, last in reversed(_contiguous(numbers)):
+            worksheet.delete_rows(first, last)
+    except (APIError, SheetsError) as exc:
+        # The comments are already gone; a stale keyword entry is harmless and
+        # gets overwritten the next time that keyword is searched.
+        _LOG.warning("Retention: could not tidy the keyword list: %s", exc)

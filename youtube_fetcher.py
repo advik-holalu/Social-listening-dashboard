@@ -51,6 +51,18 @@ ID_COLUMN = "comment_id"
 
 # API hard limits. MAX_COMMENT_PAGE and MAX_VIDEO_IDS_PER_CALL are public
 # because app.py sizes its quota estimate from them.
+# Search results are biased to this country. The brands this app watches are
+# Indian, and generic names collide badly without it: "candyman" returns a
+# Jamaican rapper before the sweet. It is a bias, not a filter, so a genuinely
+# relevant video from elsewhere still comes back. Pass region_code=None to a
+# search to turn it off, or change this to another ISO 3166-1 alpha-2 code.
+DEFAULT_REGION_CODE = "IN"
+
+# How several keywords are turned into searches: one query each, or one query
+# joining them all. Defined here because the filters further down default to it.
+MATCH_ANY = "Any"
+MATCH_ALL = "All"
+
 _MAX_SEARCH_PAGE = 50
 MAX_COMMENT_PAGE = 100
 MAX_VIDEO_IDS_PER_CALL = 50
@@ -74,6 +86,8 @@ class FetchReport:
 
     warnings: list[str] = field(default_factory=list)
     videos_searched: int = 0
+    videos_excluded: int = 0
+    videos_irrelevant: int = 0
     videos_with_comments: int = 0
     comments_fetched: int = 0
     quota_exhausted: bool = False
@@ -247,18 +261,66 @@ def build_client(api_key: str):
     return build("youtube", "v3", developerKey=api_key.strip(), cache_discovery=False)
 
 
+def _searchable_text(video: dict) -> str:
+    """A video's title and description as one lowercase line.
+
+    Runs of whitespace collapse to single spaces so a keyword typed with one
+    space still matches a title that wrapped it across a line break.
+    """
+    joined = " ".join(
+        [str(video.get("video_title", "") or ""),
+         str(video.get("video_description", "") or "")]
+    )
+    return " ".join(joined.lower().split())
+
+
+def is_relevant(video: dict, keywords: Sequence[str], match: str = MATCH_ANY) -> bool:
+    """True when the search terms actually appear in the title or description.
+
+    YouTube's idea of relevance is loose: searching a brand name returns
+    videos that never mention it. This is the strict reading of the same
+    question, and it follows the Match mode. Matching any means at least one
+    term has to be there; matching all together means every one of them does,
+    since that is what the reader asked for.
+    """
+    terms = [str(k).strip().lower() for k in keywords if str(k).strip()]
+    if not terms:
+        return True
+
+    haystack = _searchable_text(video)
+    hits = (" ".join(term.split()) in haystack for term in terms)
+    return all(hits) if match == MATCH_ALL else any(hits)
+
+
+def is_excluded(video: dict, exclude: Sequence[str]) -> bool:
+    """True when a video's title or description contains an excluded term.
+
+    Case-insensitive substring matching, so "recipe" also catches "Recipes"
+    and a phrase like "how to make" is matched as written.
+    """
+    if not exclude:
+        return False
+    haystack = " ".join(
+        [str(video.get("video_title", "") or ""),
+         str(video.get("video_description", "") or "")]
+    ).lower()
+    return any(term.lower() in haystack for term in exclude if str(term).strip())
+
+
 def search_videos(
     youtube,
     keyword: str,
     max_results: int = 20,
     order: str = "relevance",
     published_after: _dt.datetime | None = None,
-    region_code: str | None = None,
+    region_code: str | None = DEFAULT_REGION_CODE,
 ) -> list[dict]:
     """Search YouTube for `keyword` and return up to `max_results` video stubs.
 
     Costs 100 quota units per page of up to 50 results, so this is by far the
     most expensive call in the app.
+
+    `region_code` biases the results towards one country, India by default.
     """
     if max_results <= 0:
         return []
@@ -298,6 +360,7 @@ def search_videos(
                     "video_title": snippet.get("title", ""),
                     "channel_title": snippet.get("channelTitle", ""),
                     "video_published_at": snippet.get("publishedAt", ""),
+                    "video_description": snippet.get("description", ""),
                     "video_url": f"https://www.youtube.com/watch?v={video_id}",
                 }
             )
@@ -352,6 +415,9 @@ def get_video_stats(youtube, video_ids: Iterable[str]) -> dict[str, dict]:
                 "video_title": snippet.get("title", ""),
                 "channel_title": snippet.get("channelTitle", ""),
                 "video_published_at": snippet.get("publishedAt", ""),
+                # The full description, not the blurb search.list returns. No
+                # extra call: this response already carries it.
+                "video_description": snippet.get("description", ""),
                 "video_type": classify_video(details.get("duration")),
             }
 
@@ -462,10 +528,6 @@ def parse_keywords(raw: str) -> list[str]:
     return list(seen)
 
 
-MATCH_ANY = "Any"
-MATCH_ALL = "All"
-
-
 def build_queries(keywords: Sequence[str], match: str = MATCH_ANY) -> list[str]:
     """The search strings to send, from the parsed keywords.
 
@@ -514,8 +576,9 @@ def find_videos(
     max_videos: int = 20,
     order: str = "relevance",
     published_after: _dt.datetime | None = None,
-    region_code: str | None = None,
+    region_code: str | None = DEFAULT_REGION_CODE,
     match: str = MATCH_ANY,
+    exclude: Sequence[str] | None = None,
     progress_cb: ProgressCallback | None = None,
 ) -> tuple[list[dict], FetchReport]:
     """Find the videos to read, with their stats. No comments are fetched.
@@ -528,6 +591,15 @@ def find_videos(
     `max_videos` is the ceiling for the run as a whole, not per query. With
     several queries the results are taken in turn until that ceiling is met,
     so adding a keyword splits the same budget rather than multiplying it.
+
+    `exclude` drops videos whose title or description contains any of those
+    terms. The drop happens here, before any comments are read, so an excluded
+    video costs nothing beyond the search that found it.
+
+    `region_code` biases every query towards one country, India by default.
+
+    Videos that do not actually mention the keywords in their title or
+    description are dropped as well, counted separately from `exclude`.
     """
     report = FetchReport()
     queries = build_queries(keywords, match)
@@ -583,6 +655,9 @@ def find_videos(
             "channel_title": video["channel_title"],
             "video_url": video["video_url"],
             "video_published_at": video["video_published_at"],
+            # The search blurb for now; the stats call below replaces it with
+            # the full description, which is what exclusions are matched on.
+            "video_description": video.get("video_description", ""),
             "video_views": 0,
             "video_likes": 0,
             "video_comment_count": 0,
@@ -614,10 +689,36 @@ def find_videos(
             entry["video_published_at"] = (
                 detail.get("video_published_at") or entry["video_published_at"]
             )
+            entry["video_description"] = (
+                detail.get("video_description") or entry["video_description"]
+            )
             entry["video_views"] = detail.get("video_views", 0)
             entry["video_likes"] = detail.get("video_likes", 0)
             entry["video_comment_count"] = detail.get("video_comment_count", 0)
             entry["video_type"] = detail.get("video_type", "")
+
+    # Both filters run after the stats call, so the full description is in
+    # hand rather than the blurb the search returns, and before any comments
+    # are read. The reader's own exclusions go first, so a video that is both
+    # unwanted and off topic is reported as the thing they asked for.
+    if exclude:
+        kept = {
+            video_id: entry
+            for video_id, entry in found.items()
+            if not is_excluded(entry, exclude)
+        }
+        report.videos_excluded = len(found) - len(kept)
+        found = kept
+
+    relevant = {
+        video_id: entry
+        for video_id, entry in found.items()
+        if is_relevant(entry, keywords, match)
+    }
+    report.videos_irrelevant = len(found) - len(relevant)
+    found = relevant
+
+    report.videos_searched = len(found)
 
     if progress_cb is not None:
         progress_cb(total, total, "Done.")

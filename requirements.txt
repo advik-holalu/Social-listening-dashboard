@@ -3,4 +3,4 @@ pandas>=2.0
 google-api-python-client>=2.120
 google-auth>=2.29
 gspread>=6.0
-anthropic>=0.75
+google-cloud-translate>=3.15

@@ -1,25 +1,35 @@
-"""Claude-powered translation for the Social Listening app.
+"""Translation for the Social Listening app, by Google Cloud Translation.
 
 Non-English comments are translated on demand and the result is stored beside
 the comment, so a comment is only ever translated once.
 
-Nothing in here touches Streamlit's UI, only st.secrets for the API key.
+Authentication reuses the service account already configured for Sheets, so
+there is no second key to manage. That account needs the Cloud Translation API
+enabled on its project and the Cloud Translation API User role.
+
+Nothing in here touches Streamlit's UI, only st.secrets for the credentials.
 """
 
 from __future__ import annotations
 
-import json
+import html
+import logging
 import re
 from typing import Callable, Sequence
 
-import anthropic
 import pandas as pd
 import streamlit as st
+from google.api_core.exceptions import GoogleAPIError
+from google.cloud import translate_v2
+from google.oauth2.service_account import Credentials
 
-MODEL = "claude-sonnet-4-6"
+_LOG = logging.getLogger(__name__)
 
+# The same block Sheets authenticates with.
+SECRET_SERVICE_ACCOUNT = "gcp_service_account"
 
-SECRET_API_KEY = "ANTHROPIC_API_KEY"
+# Translation is its own product, with its own scope.
+SCOPES = ["https://www.googleapis.com/auth/cloud-translation"]
 
 
 # Translation columns. comment_language is what marks a comment as processed:
@@ -29,60 +39,18 @@ TRANSLATION_COLUMN = "comment_translation"
 
 
 TRANSLATION_COLUMNS: list[str] = ["comment_language", TRANSLATION_COLUMN]
-# Everything Claude writes back onto a comment row.
+# Everything the translator writes back onto a comment row.
 TAG_COLUMNS: list[str] = list(TRANSLATION_COLUMNS)
 
 
-# Comments per Claude call. Big enough that the prompt overhead is amortised,
-# small enough that one bad batch costs little to retry.
+# Comments per call. The API takes a list and bills by character, so the batch
+# size costs nothing either way; it just keeps one failure cheap to retry.
 BATCH_SIZE = 25
 
 
-# Per-comment character cap. YouTube allows very long comments; sentiment and
-# intent live in the opening lines, and this keeps a batch prompt bounded.
+# Per-comment character cap. Billing is per character and YouTube allows very
+# long comments, so a rambling one is trimmed rather than paid for in full.
 _MAX_COMMENT_CHARS = 2000
-
-
-_TRANSLATE_SYSTEM = """You translate YouTube comments for a snack brand's social
-listening dashboard. The brand is Indian, so expect English, Hindi, Tamil,
-Telugu, Kannada, Malayalam, Bengali, Marathi -- and plenty of Hinglish, meaning
-Indian languages written in the Latin alphabet.
-
-For each comment return two fields:
-
-- language: the BCP-47 code of the language the comment is actually written in,
-  regardless of alphabet. Use "en" only for genuine English. A comment written
-  in Latin letters but in Hindi words ("bahut accha hai", "kitne ka hai") is
-  "hi", not "en". Mixed comments take the language of the majority of the words.
-- translation: a natural English translation. Return an EMPTY STRING when
-  language is "en" -- there is nothing to translate.
-
-Translate meaning, not word by word, and keep it about as long as the original.
-Leave product names, brand names, and @handles as they are. If a comment is only
-emoji, punctuation, or is too garbled to read, return language "en" and an empty
-translation rather than guessing."""
-
-
-_TRANSLATE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "translations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "index": {"type": "integer"},
-                    "language": {"type": "string"},
-                    "translation": {"type": "string"},
-                },
-                "required": ["index", "language", "translation"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["translations"],
-    "additionalProperties": False,
-}
 
 
 # Progress callback: (batch_number, batch_total, tagged_so_far) -> None
@@ -94,29 +62,44 @@ class InsightsError(Exception):
 
 
 def is_configured() -> bool:
-    """True when an Anthropic API key is present in secrets."""
+    """True when the service account block is present in secrets."""
     try:
-        return bool(str(st.secrets.get(SECRET_API_KEY, "")).strip())
+        return SECRET_SERVICE_ACCOUNT in st.secrets
     except Exception:
         # st.secrets raises when there is no secrets.toml at all.
         return False
 
 
-def _client() -> anthropic.Anthropic:
+@st.cache_resource(show_spinner=False)
+def _client() -> translate_v2.Client:
+    """The Translation client, built once per session from the Sheets account.
+
+    Cached like the Sheets client: building it parses a private key and opens
+    a session, and neither needs doing per rerun.
+    """
     try:
-        api_key = str(st.secrets.get(SECRET_API_KEY, "")).strip()
-    except Exception:
-        api_key = ""
-    if not api_key:
+        info = dict(st.secrets[SECRET_SERVICE_ACCOUNT])
+    except (KeyError, FileNotFoundError) as exc:
         raise InsightsError(
-            f"No {SECRET_API_KEY} found in secrets. Add it to "
-            ".streamlit/secrets.toml to use the Insights tab."
-        )
-    return anthropic.Anthropic(api_key=api_key)
+            f"Missing [{SECRET_SERVICE_ACCOUNT}] in .streamlit/secrets.toml, "
+            "so comments cannot be translated."
+        ) from exc
+
+    # TOML escapes newlines in the private key as literal backslash-n.
+    if "private_key" in info:
+        info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
+
+    try:
+        credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
+        return translate_v2.Client(credentials=credentials)
+    except Exception as exc:
+        raise InsightsError(
+            f"Could not authenticate for translation: {exc}"
+        ) from exc
 
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a frame that definitely has every Claude-written column as text."""
+    """Return a frame that definitely has every translation column as text."""
     out = df.copy()
     for column in TAG_COLUMNS:
         if column not in out.columns:
@@ -157,21 +140,20 @@ kaise kahan hum tum ye yeh woh wo bhi nahi to se ka ki ke me main
 _NON_LATIN_LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
 
 
-def looks_non_english(text: object) -> bool:
-    """Best-effort guess at whether a comment needs translating.
+def _has_non_latin(text: str) -> bool:
+    """Devanagari, Tamil, Telugu, Kannada, Bengali and friends."""
+    return any(char.isalpha() and ord(char) > 0x02AF for char in text)
 
-    Deliberately approximate: it decides whether to offer a Translate link, and
-    Claude makes the real call once the link is clicked. Anything it misses is
-    still caught by the bulk pass in the sidebar.
+
+def _is_hinglish(text: object) -> bool:
+    """An Indian language written in the Latin alphabet.
+
+    Worth singling out because language detection reads these as English and
+    returns them untranslated, so they are sent with the source declared.
     """
     body = str(text or "").strip()
-    if not body:
+    if not body or _has_non_latin(body):
         return False
-
-    # Devanagari, Tamil, Telugu, Kannada, Bengali and friends settle it outright.
-    for char in body:
-        if char.isalpha() and ord(char) > 0x02AF:
-            return True
 
     words = set(re.findall(r"[a-z]+", body.lower()))
     if words & _STRONG_MARKERS:
@@ -179,10 +161,22 @@ def looks_non_english(text: object) -> bool:
     return len(words & _WEAK_MARKERS) >= 2
 
 
+def looks_non_english(text: object) -> bool:
+    """Best-effort guess at whether a comment needs translating.
+
+    Deliberately approximate: it decides whether to offer a Translate link,
+    and the translator settles it once the link is clicked.
+    """
+    body = str(text or "").strip()
+    if not body:
+        return False
+    return _has_non_latin(body) or _is_hinglish(body)
+
+
 def needs_translation(record) -> bool:
     """True when this comment should offer a Translate link.
 
-    A comment Claude has already looked at carries a language, so it never
+    A comment the translator has already seen carries a language, so it never
     offers the link again -- it either has a translation to show or is English.
     """
     if str(record.get("comment_language", "") or "").strip():
@@ -212,77 +206,73 @@ def pending_translation_ids(df: pd.DataFrame, limit: int | None = None) -> list[
     return ids[:limit] if limit else ids
 
 
-def translate_batch(
-    client: anthropic.Anthropic, comments: Sequence[str]
-) -> list[dict]:
-    """Detect language and translate one batch. One dict per input, in order."""
+def _call(client, values: Sequence[str], source: str | None) -> list[dict]:
+    """One Translation API call, with the errors turned into our own."""
+    try:
+        result = client.translate(
+            list(values),
+            target_language="en",
+            format_="text",
+            source_language=source,
+        )
+    except GoogleAPIError as exc:
+        raise InsightsError(
+            f"Google Translation refused the request: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise InsightsError(f"Could not reach Google Translation: {exc}") from exc
+
+    # A single string comes back as a dict rather than a list of one.
+    return [result] if isinstance(result, dict) else list(result)
+
+
+def translate_batch(client, comments: Sequence[str]) -> list[dict]:
+    """Detect language and translate one batch. One dict per input, in order.
+
+    Comments go out with the language auto-detected, except the ones our own
+    heuristic reads as an Indian language typed in Latin letters. Detection
+    calls those English and hands them straight back, so they are sent as
+    Hindi instead and actually get translated.
+    """
     if not comments:
         return []
 
-    numbered = "\n\n".join(
-        f"<comment index=\"{i}\">\n{_clip(text)}\n</comment>"
-        for i, text in enumerate(comments)
-    )
-    prompt = (
-        f"Identify the language of each of the {len(comments)} comments below "
-        "and translate the ones that are not English. Return one entry per "
-        "comment, using the same index it was given.\n\n" + numbered
-    )
+    texts = [_clip(text) for text in comments]
+    results: list[dict] = [{"language": "en", "translation": ""} for _ in texts]
 
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=16000,
-            system=_TRANSLATE_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={
-                "format": {"type": "json_schema", "schema": _TRANSLATE_SCHEMA}
-            },
-        )
-    except anthropic.AuthenticationError as exc:
-        raise InsightsError(
-            f"Anthropic rejected the API key. Check {SECRET_API_KEY} in secrets."
-        ) from exc
-    except anthropic.RateLimitError as exc:
-        raise InsightsError(
-            "Anthropic rate limit hit. Wait a moment and translate the rest."
-        ) from exc
-    except anthropic.APIStatusError as exc:
-        raise InsightsError(f"Anthropic API error ({exc.status_code}): {exc}") from exc
-    except anthropic.APIConnectionError as exc:
-        raise InsightsError(f"Could not reach the Anthropic API: {exc}") from exc
+    detect_at = [i for i, text in enumerate(texts) if text and not _is_hinglish(text)]
+    hinglish_at = [i for i, text in enumerate(texts) if text and _is_hinglish(text)]
 
-    text = next((b.text for b in response.content if b.type == "text"), "")
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise InsightsError(f"Claude returned unreadable JSON: {exc}") from exc
-
-    by_index: dict[int, dict] = {}
-    for entry in payload.get("translations", []):
-        try:
-            position = int(entry.get("index"))
-        except (TypeError, ValueError):
+    for positions, source in ((detect_at, None), (hinglish_at, "hi")):
+        if not positions:
             continue
-        if not 0 <= position < len(comments):
-            continue
-        language = str(entry.get("language", "")).strip().lower() or "en"
-        translation = str(entry.get("translation", "")).strip()
-        # An English comment has nothing to translate; drop any echo of itself.
-        if language.startswith("en"):
-            translation = ""
-        by_index[position] = {"language": language, "translation": translation}
+        for position, payload in zip(
+            positions, _call(client, [texts[i] for i in positions], source)
+        ):
+            results[position] = _as_result(texts[position], payload, source)
 
-    # A comment the model skipped is marked English rather than left pending,
-    # so one odd batch cannot loop forever.
-    return [
-        by_index.get(i, {"language": "en", "translation": ""})
-        for i in range(len(comments))
-    ]
+    return results
+
+
+def _as_result(original: str, payload: dict, source: str | None) -> dict:
+    """One API response turned into the pair stored on the row."""
+    language = str(
+        payload.get("detectedSourceLanguage") or source or "en"
+    ).strip().lower()
+    # The API returns HTML entities even asking for plain text.
+    translation = html.unescape(str(payload.get("translatedText", "") or "")).strip()
+
+    # English in, nothing to store. Same when the translation only echoes the
+    # original, which is what comes back for a comment that was already English
+    # or was only emoji.
+    if language.startswith("en") or translation.lower() == original.strip().lower():
+        return {"language": "en" if language.startswith("en") else language,
+                "translation": ""}
+    return {"language": language, "translation": translation}
 
 
 def translate_rows(df: pd.DataFrame, ids: Sequence[str]) -> tuple[pd.DataFrame, int]:
-    """Translate exactly these comment_ids in a single Claude call.
+    """Translate exactly these comment_ids in a single call.
 
     Returns (updated_frame, rows_touched). Ids already carrying a language are
     dropped before the call, so a double click costs nothing.

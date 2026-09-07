@@ -156,13 +156,44 @@ def _sidebar() -> dict:
     # this names the whole panel and pairs with the Run Search button ending it.
     st.sidebar.header("Start a search")
 
-    keywords_raw = st.sidebar.text_input(
-        "What do you want to search on YouTube?",
-        value="GO DESi",
-        key="keywords_raw",
-        help="Separate several with commas, e.g. GO DESi, imli pop, chikki",
-    )
+    # The box and the button share a form so that Enter in the box runs the
+    # search, which is what the box says it will do. A plain text input only
+    # commits its value on Enter; the run itself hung off the button, so the
+    # keystroke did nothing visible. A form submits on Enter by design, and
+    # the button is that form's submit, so both routes are the same route.
+    with st.sidebar.form("search_form", border=False, enter_to_submit=True):
+        # The box starts empty on purpose. A pre-filled value hides the
+        # placeholder, and the placeholder is where the guidance lives:
+        # people were typing whole questions like "khakra negative feedback"
+        # and getting nothing, because this searches YouTube for the words as
+        # typed rather than interpreting them.
+        keywords_raw = st.text_input(
+            "Which keyword do you want to search for on YouTube?",
+            value="",
+            key="keywords_raw",
+            placeholder="Khakra, GO DESi",
+            help=(
+                "Type product or brand names only, e.g. Khakra, GO DESi. "
+                "Separate several with commas. Filtering by sentiment or "
+                "feedback type is coming with paid plans."
+            ),
+        )
+        exclude_raw = st.text_input(
+            "Exclude keywords",
+            value="",
+            key="exclude_raw",
+            placeholder="recipe, how to make",
+            help=(
+                "Optional. Videos whose title or description contains any of "
+                "these are skipped. Separate several with commas, the same as "
+                "above."
+            ),
+        )
+        run = st.form_submit_button(
+            "Run Search", type="primary", width="stretch"
+        )
     keywords = parse_keywords(keywords_raw)
+    exclude = parse_keywords(exclude_raw)
 
     # A radio rather than a segmented control: these labels are sentences, and
     # a stretched segmented control in a narrow sidebar wraps them into ragged
@@ -193,8 +224,6 @@ def _sidebar() -> dict:
 
     options = _search_options()
 
-    run = st.sidebar.button("Run Search", type="primary", use_container_width=True)
-
     # The Sheet has not been read yet at this point in the run -- the page
     # draws before the fetch on purpose -- so the past-searches list gets a
     # reserved slot here and is filled once the history arrives.
@@ -203,8 +232,8 @@ def _sidebar() -> dict:
     _help_section()
 
     return {
-        "keywords": keywords, "run": run, "past_slot": past_slot,
-        "match": match, **options,
+        "keywords": keywords, "exclude": exclude, "run": run,
+        "past_slot": past_slot, "match": match, **options,
     }
 
 
@@ -268,7 +297,8 @@ def _help_page() -> None:
         "1. Type what you want to search for in the sidebar on the left.\n"
         "2. Choose whether your keywords should be searched separately or "
         "together.\n"
-        "3. Press **Run Search** and wait. It usually takes under a minute.\n"
+        "3. Press Enter, or click **Run Search**, and wait. It usually takes "
+        "under a minute.\n"
         "4. Read the results. They are saved for you automatically.\n\n"
         ":gray[Everything else on this page is detail. If you only remember "
         "these four steps, you can use the tool.]",
@@ -286,9 +316,24 @@ def _help_page() -> None:
         "keywords, not five.\n\n"
         "**Capital letters do not matter.** YouTube treats `imli pop` and "
         "`Imli Pop` the same way.\n\n"
+        "**Names, not questions.** Type what a product or brand is called, "
+        "not what you want to know about it. `khakra negative feedback` "
+        "searches YouTube for those three words together and finds close to "
+        "nothing. Search `khakra`, then read the results or use the search "
+        "box above them. Filtering by sentiment or feedback type is coming "
+        "with paid plans.\n\n"
         "**Think about what real people type.** They shorten names, they "
         "misspell them, and they use nicknames. Adding those as extra "
-        "keywords finds comments you would otherwise miss.",
+        "keywords finds comments you would otherwise miss.\n\n"
+        "**Only videos that actually say it are read.** YouTube calls a lot "
+        "of videos relevant that never mention what you searched for. Those "
+        "are dropped, and the summary tells you how many. A video counts as "
+        "a match when the words appear in its title or its description.\n\n"
+        "**Exclude keywords** is the opposite, and it is optional. Anything "
+        "you put there is thrown out: a video is skipped when its title or "
+        "its description contains any of those words. Searching `chikki` "
+        "while excluding `recipe, how to make` drops the cooking tutorials "
+        "and leaves you the people actually eating it.",
     )
     _help_card(
         right,
@@ -357,13 +402,15 @@ def _help_page() -> None:
         "The tool finds the videos first, then reads the comments on each "
         "one. A progress bar tells you where it has got to. Leave the tab "
         "open while it runs.\n\n"
-        "When it finishes you get three numbers:\n\n"
-        "- **Comments collected** is how many comments this search brought "
-        "back.\n"
-        "- **Newly saved** is how many of those were new. Search the same "
-        "thing twice and this number will be smaller the second time, "
-        "because the same comment is never stored twice.\n"
-        "- **Videos** is how many videos those comments came from.\n\n"
+        "When it finishes you get two numbers:\n\n"
+        "- **New comments found** is how many comments this search added that "
+        "you did not already have. Search the same thing twice and this will "
+        "be small the second time, because the same comment is never kept "
+        "twice.\n"
+        "- **Videos searched** is how many videos those comments came "
+        "from.\n\n"
+        "Under them is a line telling you how many comments you now hold for "
+        "this search in total, counting everything collected before.\n\n"
         "A new search replaces the one on screen. The old one is not lost. It "
         "stays in **Past searches** in the sidebar, ready to download.",
     )
@@ -452,6 +499,12 @@ def _help_page() -> None:
         "searched before, with the number of comments held for each one. "
         "Click any of them to download it as a CSV file. That is how you get "
         "back to a search from last week, or one a colleague ran.\n\n"
+        f"**Only the {sheets_store.KEYWORD_LIMIT} most recent searches are "
+        "kept.** When a new keyword takes the list past that, the one nobody "
+        "has searched for the longest is deleted along with its comments, and "
+        "it cannot be brought back. Searching an old keyword again makes it "
+        "recent, so it is safe. Download anything you want to keep for "
+        "good.\n\n"
         "The **Reload saved results** button at the very bottom of the page "
         "fetches the latest stored comments. Press it if someone else has "
         "been running searches while you had the tab open.",
@@ -568,6 +621,17 @@ def _search_options() -> dict:
             "shared across your keywords. More videos takes longer."
         ),
     )
+
+    # A nudge, not an error: going higher is allowed, it just costs time and
+    # eats into what everyone shares for the day.
+    if int(videos_per_keyword) > DEFAULT_VIDEOS_PER_KEYWORD:
+        st.sidebar.warning(
+            f"We recommend keeping this at {DEFAULT_VIDEOS_PER_KEYWORD}. "
+            "Going higher searches more videos, which takes longer and can "
+            "use up daily limits faster.",
+            icon=":material/warning:",
+        )
+
     days_back = st.sidebar.number_input(
         "From the last N days",
         min_value=0,
@@ -633,6 +697,7 @@ def _run_search(config: dict) -> None:
             order=config["order"],
             published_after=config["published_after"],
             match=config["match"],
+            exclude=config["exclude"],
             progress_cb=on_progress,
         )
     except InvalidAPIKeyError as exc:
@@ -666,7 +731,21 @@ def _run_search(config: dict) -> None:
     if not videos:
         progress.empty()
         status.empty()
-        st.info("No videos matched. Try a different keyword.")
+        if report.videos_excluded and not report.videos_irrelevant:
+            st.info(
+                f"All {report.videos_excluded:,} video(s) found were skipped "
+                "by your excluded words. Remove one of them, or search for "
+                "something else."
+            )
+        elif report.videos_irrelevant:
+            st.info(
+                f"{report.videos_irrelevant:,} video(s) came back, but none "
+                "of them mentioned your keywords in the title or "
+                "description, so none were read. Try a shorter keyword, or "
+                "match any of them instead of all together."
+            )
+        else:
+            st.info("No videos matched. Try a different keyword.")
         return
 
     # Straight on to the comments, reusing the same progress bar so the run
@@ -680,6 +759,8 @@ def _run_search(config: dict) -> None:
                 config["keywords"], config["match"]
             ),
             "include_replies": config["include_replies"],
+            "excluded": report.videos_excluded,
+            "irrelevant": report.videos_irrelevant,
         },
         on_progress,
     )
@@ -709,6 +790,7 @@ def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
     _stamp_refresh()
 
     written = 0
+    retired: dict[str, int] = {}
     if rows and sheets_store.is_configured():
         try:
             with st.spinner("Saving your results..."):
@@ -719,6 +801,21 @@ def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
             st.session_state["fetch_error"] = (
                 f"The comments were fetched but could not be saved: {exc}"
             )
+        else:
+            # Housekeeping, in its own hands: the comments are already safely
+            # stored, so a problem here is for the log, not for the reader.
+            try:
+                with st.spinner("Tidying up old searches..."):
+                    # Stamped whether or not anything was written: a repeat
+                    # search that finds no new comments still counts as a
+                    # fresh search, and that is what keeps it out of the
+                    # cleanup that follows.
+                    sheets_store.record_search(config["keywords"])
+                    retired = sheets_store.apply_retention()
+                if retired:
+                    _fetch_history.clear()
+            except SheetsError as exc:
+                _LOG.exception("Keeping the Sheet to its keyword limit failed")
 
     for keyword in config["keywords"]:
         if keyword not in st.session_state["session_keywords"]:
@@ -730,24 +827,62 @@ def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
         "added": added,
         "written": written,
         "keywords": list(config["keywords"]),
+        "excluded": int(config.get("excluded", 0)),
+        "irrelevant": int(config.get("irrelevant", 0)),
+        "retired": retired,
         "ids": {str(row.get("comment_id", "")) for row in rows},
     }
 
 
 def _run_summary() -> None:
-    """The one-line "here is what just happened" block in the Search tab."""
+    """What this search just added, and nothing else at the same weight.
+
+    Two cards, both about this run. The running total sits below them as a
+    line of text: side by side with the new count it read as a rival figure,
+    and people took the bigger one for the result of their search.
+    """
     last = st.session_state["last_run"]
     if not last:
         return
 
-    st.success(
-        f"{last['comments']:,} comments collected from {last['videos']:,} videos"
-    )
+    saved = sheets_store.is_configured()
+    # Without a store nothing is written, so "new" means new to this session.
+    found = int(last.get("written", 0)) if saved else int(last.get("added", 0))
 
-    one, two, three = st.columns(3)
-    one.metric("Comments collected", f"{last['comments']:,}")
-    two.metric("Newly saved", f"{last.get('written', 0):,}")
-    three.metric("Videos", f"{last['videos']:,}")
+    one, two = st.columns(2)
+    one.metric("New comments found", f"{found:,}")
+    two.metric("Videos searched", f"{last['videos']:,}")
+
+    total = len(_live_rows(insights.ensure_columns(st.session_state["data"])))
+    if total:
+        st.caption(
+            f"You now have {total:,} total comments "
+            + ("saved for this search." if saved else "for this search.")
+        )
+
+    skipped = int(last.get("excluded", 0))
+    if skipped:
+        st.caption(
+            f"{skipped:,} video(s) skipped because they matched your excluded "
+            "words."
+        )
+
+    off_topic = int(last.get("irrelevant", 0))
+    if off_topic:
+        st.caption(
+            f"{off_topic:,} video(s) dropped because your keywords did not "
+            "appear in the title or description."
+        )
+
+    retired = last.get("retired") or {}
+    if retired:
+        names = ", ".join(sorted(retired))
+        rows = sum(retired.values())
+        st.caption(
+            f"Room is kept for the {sheets_store.KEYWORD_LIMIT} most recent "
+            f"searches, so the oldest {len(retired)} ({names}) and their "
+            f"{rows:,} comments were removed."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -820,7 +955,7 @@ VIDEOS_PER_PAGE = 10
 # The stepper's increment. Keeps the control on round numbers.
 VIDEO_PAGE_STEP = 10
 
-# Comments per Claude call when a Translate button is pressed.
+# Comments per translation call when a Translate button is pressed.
 TRANSLATE_BATCH = 25
 
 
@@ -862,6 +997,22 @@ def _translate_ids(ids: Sequence[str]) -> int:
     return done
 
 
+def video_open_key(video_id: str) -> str:
+    """Session key holding whether one video's section is open.
+
+    A keyed expander keeps its own open state in session state, which is the
+    point: translating reruns the script, and without a key the section the
+    reader was inside collapses and has to be found and opened again.
+    """
+    return f"video_open_{video_id}"
+
+
+def _keep_open(open_key: str | None) -> None:
+    """Leave a video's section open across the rerun that is about to happen."""
+    if open_key:
+        st.session_state[open_key] = True
+
+
 def _translate_video(rows: pd.DataFrame) -> None:
     """Translate every untranslated non-English comment on one video."""
     ids = [
@@ -873,7 +1024,9 @@ def _translate_video(rows: pd.DataFrame) -> None:
         _translate_ids(ids)
 
 
-def _translate_button(rows: pd.DataFrame, video_id: str) -> None:
+def _translate_button(
+    rows: pd.DataFrame, video_id: str, open_key: str | None = None
+) -> None:
     """A real button, shown only when this video has something to translate."""
     if not insights.is_configured():
         return
@@ -889,6 +1042,7 @@ def _translate_button(rows: pd.DataFrame, video_id: str) -> None:
     ):
         with st.spinner(f"Translating {pending:,} comment(s)..."):
             _translate_video(rows)
+        _keep_open(open_key)
         st.rerun()
 
 
@@ -945,7 +1099,9 @@ def _visible_columns(df: pd.DataFrame) -> list[str]:
     return visible
 
 
-def _translate_selected(df: pd.DataFrame, key: str) -> None:
+def _translate_selected(
+    df: pd.DataFrame, key: str, open_key: str | None = None
+) -> None:
     """Translate whichever rows are selected in the table above.
 
     Streamlit has no hover action inside a dataframe and this app stays clear
@@ -974,12 +1130,13 @@ def _translate_selected(df: pd.DataFrame, key: str) -> None:
     ):
         with st.spinner("Translating..."):
             _translate_ids(pending)
+        _keep_open(open_key)
         st.rerun()
 
 
 def _comment_table(
     df: pd.DataFrame, height: int = 560, key: str | None = None,
-    selectable: bool = True,
+    selectable: bool = True, open_key: str | None = None,
 ) -> None:
     """One table of comments, used by every view so they read alike."""
     present = _visible_columns(df)
@@ -1000,7 +1157,7 @@ def _comment_table(
     )
 
     if selectable and key and insights.is_configured():
-        _translate_selected(df, key)
+        _translate_selected(df, key, open_key)
 
 
 def _all_comments(df: pd.DataFrame) -> None:
@@ -1254,17 +1411,24 @@ def _drilldown(df: pd.DataFrame, order_label: str) -> None:
     for video_id in page:
         title = str(titles.get(video_id, "") or video_id)
         count = int(counts.get(video_id, 0))
-        with st.expander(f"{title[:90]} - {count:,} comment(s)"):
+        open_key = video_open_key(str(video_id))
+        # Set before the expander is made, which is the only moment a widget's
+        # state can be written. Closed unless something asked for it to stay.
+        st.session_state.setdefault(open_key, False)
+
+        with st.expander(f"{title[:90]} - {count:,} comment(s)", key=open_key):
             rows = df[df["video_id"] == video_id]
             url = str(rows["video_url"].iloc[0]) if "video_url" in rows else ""
             if url:
                 st.caption(f"[Watch on YouTube]({url})")
 
-            _translate_button(rows, str(video_id))
+            _translate_button(rows, str(video_id), open_key)
 
             # Short videos get a short table rather than a fixed pane of blank.
             height = min(560, 90 + 40 * max(len(rows), 1))
-            _comment_table(rows, height=height, key=f"table_{video_id}")
+            _comment_table(
+                rows, height=height, key=f"table_{video_id}", open_key=open_key
+            )
 
 
 # --------------------------------------------------------------------------
@@ -1302,6 +1466,11 @@ def main() -> None:
         # onto the previous keyword's report.
         st.session_state["last_run"] = None
         st.session_state["session_keywords"] = []
+        # The find-within box belongs to the results it was typed against.
+        # Left alone it would quietly filter the next keyword's comments by
+        # the last one's word, and an empty report looks like a failed search.
+        # Safe to set here: the box is drawn further down this same run.
+        st.session_state["comment_search"] = ""
         _run_search(config)
 
     if st.session_state["fetch_error"]:
