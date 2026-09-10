@@ -20,13 +20,25 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, SpreadsheetNotFound, WorksheetNotFound
 
+import projects
+import usage
+from classify import CLASSIFY_COLUMNS
+from projects import PROJECT_COLUMNS
 from insights import TAG_COLUMNS
-from youtube_fetcher import COLUMNS, ID_COLUMN
+from youtube_fetcher import (
+    COLUMNS,
+    ID_COLUMN,
+    PLATFORM_YOUTUBE,
+    pack_metrics,
+)
 
-# The sheet carries the fetched columns plus the translation columns --
-# the sentiment tags and the translation. Those go last so a sheet written
-# before they existed can be widened in place.
-SHEET_COLUMNS: list[str] = COLUMNS + TAG_COLUMNS
+# Everything an analysis pass writes back onto a row that already exists:
+# the translation and the two labels. They go last so a sheet written before
+# they existed can be widened in place.
+ANALYSIS_COLUMNS: list[str] = TAG_COLUMNS + CLASSIFY_COLUMNS
+
+# The sheet carries the fetched columns plus those.
+SHEET_COLUMNS: list[str] = COLUMNS + ANALYSIS_COLUMNS
 
 # Read/write on Sheets only. Drive scope is required for open_by_key on some
 # service accounts, so it is included read-only.
@@ -59,13 +71,11 @@ _LOG = logging.getLogger(__name__)
 # Columns that should come back as numbers, not strings, after a round-trip
 # through Sheets (everything arrives as text).
 _NUMERIC_COLUMNS = [
-    "video_views",
-    "video_likes",
-    "video_comment_count",
+    "engagement_score",
     "comment_likes",
     "reply_count",
 ]
-_DATETIME_COLUMNS = ["comment_published_at", "video_published_at", "fetched_at"]
+_DATETIME_COLUMNS = ["comment_published_at", "source_published_at", "fetched_at"]
 
 # Sheets rejects very large single requests; append and update in slices.
 _APPEND_CHUNK = 500
@@ -269,7 +279,7 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
         if column in df.columns:
             df[column] = pd.to_datetime(df[column], errors="coerce", utc=True, format="mixed")
 
-    for column in TAG_COLUMNS:
+    for column in ANALYSIS_COLUMNS:
         if column in df.columns:
             df[column] = df[column].fillna("").astype(str).str.strip()
 
@@ -388,7 +398,10 @@ def _cell(value: object) -> str | int | float:
 
 
 def update_analysis(df: pd.DataFrame) -> int:
-    """Write the translations back onto rows that already exist in the Sheet.
+    """Write the analysis columns back onto rows that already exist.
+
+    Translations and labels take the same path: matched on comment_id, only
+    those columns written.
 
     Matches on comment_id and writes only the analysis columns, so a concurrent
     fetch appending new rows cannot be clobbered. Returns the number of rows
@@ -398,7 +411,7 @@ def update_analysis(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
 
-    present = [column for column in TAG_COLUMNS if column in df.columns]
+    present = [column for column in ANALYSIS_COLUMNS if column in df.columns]
     if not present:
         return 0
 
@@ -665,3 +678,340 @@ def _drop_from_search_log(keywords: Sequence[str]) -> None:
         # The comments are already gone; a stale keyword entry is harmless and
         # gets overwritten the next time that keyword is searched.
         _LOG.warning("Retention: could not tidy the keyword list: %s", exc)
+
+
+# --------------------------------------------------------------------------
+# One-time migration to the platform-agnostic schema
+# --------------------------------------------------------------------------
+# The Sheet was written when YouTube was the only source, so its columns were
+# named for videos. RENAMED_COLUMNS is the old name to new name map; the three
+# YouTube counts collapse into engagement_score plus a platform_metrics blob.
+RENAMED_COLUMNS = {
+    "video_id": "source_id",
+    "video_title": "source_title",
+    "video_url": "source_url",
+    "video_published_at": "source_published_at",
+    "channel_title": "channel_or_subreddit",
+}
+
+# Folded into platform_metrics, with views promoted to engagement_score.
+FOLDED_COLUMNS = {
+    "video_views": "views",
+    "video_likes": "likes",
+    "video_comment_count": "comment_count",
+}
+
+
+def needs_migration() -> bool:
+    """True when the Sheet still carries the old video-shaped header."""
+    header = _get_worksheet().row_values(1)
+    return any(name in header for name in RENAMED_COLUMNS)
+
+
+def _migrated_rows(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[list]:
+    """Old rows re-laid into SHEET_COLUMNS order. Pure, so it can be tested."""
+    at = {str(name).strip(): index for index, name in enumerate(header)}
+
+    def value(row: Sequence[str], name: str) -> str:
+        index = at.get(name)
+        if index is None or index >= len(row):
+            return ""
+        return str(row[index]).strip()
+
+    out: list[list] = []
+    for row in rows:
+        if not any(str(cell).strip() for cell in row):
+            continue
+
+        metrics = {}
+        for old, key in FOLDED_COLUMNS.items():
+            raw = value(row, old)
+            if raw:
+                try:
+                    metrics[key] = int(float(raw))
+                except (TypeError, ValueError):
+                    metrics[key] = raw
+
+        built: dict[str, object] = {}
+        for name in SHEET_COLUMNS:
+            if name in at:                       # already the new name
+                built[name] = value(row, name)
+                continue
+            built[name] = ""
+
+        for old, new in RENAMED_COLUMNS.items():
+            if not built.get(new):
+                built[new] = value(row, old)
+
+        # Everything already in the Sheet came from YouTube.
+        built["platform"] = built.get("platform") or PLATFORM_YOUTUBE
+        if not built.get("engagement_score"):
+            built["engagement_score"] = metrics.get("views", "")
+        if not built.get("platform_metrics"):
+            built["platform_metrics"] = pack_metrics(metrics)
+
+        out.append([built.get(name, "") for name in SHEET_COLUMNS])
+    return out
+
+
+def migrate_schema(backup: bool = True) -> dict:
+    """Rewrite the comments tab into the platform-agnostic schema.
+
+    Every old column is carried over: the renamed ones keep their values under
+    the new name, and the three YouTube counts move into platform_metrics with
+    views promoted to engagement_score. Returns a report of what happened.
+
+    A copy of the tab is taken first unless `backup` is False, because this
+    rewrites every row in place.
+    """
+    worksheet = _get_worksheet()
+    values = worksheet.get_all_values()
+    if not values:
+        return {"status": "empty", "rows": 0}
+
+    header = [str(name).strip() for name in values[0]]
+    if not any(name in header for name in RENAMED_COLUMNS):
+        return {"status": "already migrated", "rows": len(values) - 1}
+
+    migrated = _migrated_rows(header, values[1:])
+    report = {
+        "status": "migrated",
+        "rows": len(migrated),
+        "old_columns": len(header),
+        "new_columns": len(SHEET_COLUMNS),
+        "backup": "",
+    }
+
+    if backup:
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"{worksheet.title}_backup_{stamp}"
+        try:
+            _get_spreadsheet(_sheet_key()).duplicate_sheet(
+                source_sheet_id=worksheet.id, new_sheet_name=name
+            )
+            report["backup"] = name
+            _LOG.warning("Migration: copied %r to %r first", worksheet.title, name)
+        except APIError as exc:
+            raise SheetsError(
+                f"Could not back the Sheet up before migrating: {exc}"
+            ) from exc
+
+    _LOG.warning(
+        "Migration: rewriting %d row(s) from %d old columns to %d new ones",
+        len(migrated), len(header), len(SHEET_COLUMNS),
+    )
+    try:
+        worksheet.clear()
+        worksheet.update(range_name="A1", values=[list(SHEET_COLUMNS)])
+        for start in range(0, len(migrated), _APPEND_CHUNK):
+            worksheet.append_rows(
+                migrated[start : start + _APPEND_CHUNK],
+                value_input_option="RAW",
+            )
+    except APIError as exc:
+        raise SheetsError(f"Migration failed part way through: {exc}") from exc
+
+    _LOG.warning("Migration: done, %d row(s) now in the new schema", len(migrated))
+    return report
+
+
+# --------------------------------------------------------------------------
+# Written summaries
+# --------------------------------------------------------------------------
+# The Analysis view's brief, kept beside the comments it describes so it
+# survives a refresh. Keyed by the fingerprint of the exact set of comments and
+# labels it was written from, which is what makes "never regenerate an
+# unchanged set" hold across sessions rather than only within one.
+DIGEST_WORKSHEET = "digests"
+DIGEST_COLUMNS: list[str] = [
+    "fingerprint", "keywords", "comments", "digest", "written_at",
+]
+
+
+def _digest_sheet() -> gspread.Worksheet:
+    return _named_worksheet_cached(
+        _sheet_key(), DIGEST_WORKSHEET, tuple(DIGEST_COLUMNS)
+    )
+
+
+def load_digests() -> dict[str, str]:
+    """Every stored summary, keyed by fingerprint.
+
+    A tab that cannot be read is not a reason to lose the Analysis view, so
+    this returns nothing rather than raising.
+    """
+    try:
+        values = _digest_sheet().get_all_values()
+    except Exception as exc:
+        # Anything at all: a missing tab, a permissions change, a gspread
+        # surprise. A summary that cannot be read is not worth a broken page.
+        _LOG.warning("Could not read the summaries: %s", exc)
+        return {}
+
+    if not values:
+        return {}
+    header = [str(name).strip() for name in values[0]]
+    try:
+        key_at = header.index("fingerprint")
+        text_at = header.index("digest")
+    except ValueError:
+        _LOG.warning("The summaries tab has an unexpected header: %s", header)
+        return {}
+
+    out: dict[str, str] = {}
+    for row in values[1:]:
+        if len(row) <= max(key_at, text_at):
+            continue
+        key = str(row[key_at]).strip()
+        text = str(row[text_at]).strip()
+        if key and text:
+            out[key] = text
+    return out
+
+
+def save_digest(
+    fingerprint: str, digest: str, keywords: str = "", comments: int = 0
+) -> None:
+    """Store one summary, replacing any earlier one for the same fingerprint."""
+    key = str(fingerprint or "").strip()
+    text = str(digest or "").strip()
+    if not key or not text:
+        return
+
+    worksheet = _digest_sheet()
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    row = [key, str(keywords), int(comments), text, stamp]
+
+    try:
+        values = worksheet.get_all_values()
+        header = [str(name).strip() for name in values[0]] if values else []
+        key_at = header.index("fingerprint") if "fingerprint" in header else 0
+        existing = next(
+            (
+                number
+                for number, line in enumerate(values[1:], start=2)
+                if len(line) > key_at and str(line[key_at]).strip() == key
+            ),
+            0,
+        )
+        if existing:
+            worksheet.update(
+                range_name=f"A{existing}", values=[row], value_input_option="RAW"
+            )
+        else:
+            worksheet.append_row(row, value_input_option="RAW")
+    except APIError as exc:
+        raise SheetsError(f"Could not save the summary: {exc}") from exc
+
+
+# --------------------------------------------------------------------------
+# Projects
+# --------------------------------------------------------------------------
+# A named search, stored as its definition rather than as a copy of the rows
+# it covers. See projects.py for why membership is a query and not a list.
+PROJECT_WORKSHEET = "projects"
+
+
+def _project_sheet() -> gspread.Worksheet:
+    return _named_worksheet_cached(
+        _sheet_key(), PROJECT_WORKSHEET, tuple(PROJECT_COLUMNS)
+    )
+
+
+def load_projects() -> list[dict]:
+    """Every saved project, most recently updated first.
+
+    A tab that cannot be read costs the projects list, never the app.
+    """
+    try:
+        values = _project_sheet().get_all_values()
+    except Exception as exc:
+        _LOG.warning("Could not read the projects: %s", exc)
+        return []
+
+    if not values:
+        return []
+    header = [str(name).strip() for name in values[0]]
+    found = [projects.from_row(header, row) for row in values[1:]]
+    out = [project for project in found if project]
+    return sorted(out, key=lambda p: p.get("updated_at", ""), reverse=True)
+
+
+def save_project(project: dict) -> None:
+    """Store one project, replacing any earlier version of the same id."""
+    key = str(project.get("project_id", "") or "").strip()
+    if not key:
+        return
+
+    worksheet = _project_sheet()
+    row = projects.to_row(project)
+    try:
+        values = worksheet.get_all_values()
+        header = [str(name).strip() for name in values[0]] if values else []
+        key_at = header.index("project_id") if "project_id" in header else 0
+        existing = next(
+            (
+                number
+                for number, line in enumerate(values[1:], start=2)
+                if len(line) > key_at and str(line[key_at]).strip() == key
+            ),
+            0,
+        )
+        if existing:
+            worksheet.update(
+                range_name=f"A{existing}", values=[row], value_input_option="RAW"
+            )
+        else:
+            worksheet.append_row(row, value_input_option="RAW")
+    except APIError as exc:
+        raise SheetsError(f"Could not save the project: {exc}") from exc
+
+
+def delete_project(project_id: str) -> None:
+    """Forget one project. The comments it referenced are untouched."""
+    key = str(project_id or "").strip()
+    if not key:
+        return
+    try:
+        worksheet = _project_sheet()
+        values = worksheet.get_all_values()
+        header = [str(name).strip() for name in values[0]] if values else []
+        key_at = header.index("project_id") if "project_id" in header else 0
+        doomed = [
+            number
+            for number, line in enumerate(values[1:], start=2)
+            if len(line) > key_at and str(line[key_at]).strip() == key
+        ]
+        for first, last in reversed(_contiguous(doomed)):
+            worksheet.delete_rows(first, last)
+    except APIError as exc:
+        raise SheetsError(f"Could not delete the project: {exc}") from exc
+
+
+# --------------------------------------------------------------------------
+# Usage log
+# --------------------------------------------------------------------------
+# Append only, one row per metered event. Read back by the Usage page to total
+# what the app has spent where the provider will not tell us itself.
+def _usage_sheet() -> gspread.Worksheet:
+    return _named_worksheet_cached(
+        _sheet_key(), usage.USAGE_WORKSHEET, tuple(usage.USAGE_COLUMNS)
+    )
+
+
+def record_usage(row: Sequence) -> None:
+    """Append one usage row. Raises only so the caller can log and move on."""
+    try:
+        _usage_sheet().append_row(list(row), value_input_option="RAW")
+    except APIError as exc:
+        raise SheetsError(f"Could not record usage: {exc}") from exc
+
+
+def load_usage() -> list[list]:
+    """Every logged event, oldest first. Nothing on failure."""
+    try:
+        values = _usage_sheet().get_all_values()
+    except Exception as exc:
+        _LOG.warning("Could not read the usage log: %s", exc)
+        return []
+    return [list(row) for row in values[1:]] if values else []

@@ -4,3 +4,5 @@ google-api-python-client>=2.120
 google-auth>=2.29
 gspread>=6.0
 google-cloud-translate>=3.15
+apify-client>=3.2
+anthropic>=0.75

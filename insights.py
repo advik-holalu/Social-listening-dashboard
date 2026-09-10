@@ -246,10 +246,20 @@ def translate_batch(client, comments: Sequence[str]) -> list[dict]:
     for positions, source in ((detect_at, None), (hinglish_at, "hi")):
         if not positions:
             continue
-        for position, payload in zip(
-            positions, _call(client, [texts[i] for i in positions], source)
-        ):
+        sent = [texts[i] for i in positions]
+        for position, payload in zip(positions, _call(client, sent, source)):
             results[position] = _as_result(texts[position], payload, source)
+
+        # Counted where it is spent, per call: Google bills by the character
+        # of text sent, and does not expose usage to this service account, so
+        # this is the only honest figure. A Hinglish batch is a second call
+        # and is counted as one.
+        try:
+            import usage
+
+            usage.record_translation(sum(len(text) for text in sent), len(sent))
+        except Exception as exc:
+            _LOG.warning("Could not meter the translation: %s", exc)
 
     return results
 

@@ -16,7 +16,15 @@ from typing import Sequence
 import pandas as pd
 import streamlit as st
 
+import altair as alt
+
+import analysis
+import classify
 import insights
+import projects
+import reddit_fetcher
+import relevance
+import usage
 import sheets_store
 import youtube_fetcher
 from insights import InsightsError
@@ -57,11 +65,20 @@ ORDER_OPTIONS: dict[str, str | None] = {
 
 # The column each ordering sorts on locally, all descending. "Most relevant"
 # has no column: it keeps the order the videos were collected in.
+# What each ordering sorts the source sections on. "Most viewed" and
+# "Highest rated" read the shared engagement column and the metrics blob
+# respectively, so a second platform sorts without new columns.
+# Two orderings read a number that is not a column of its own any more: it
+# lives in platform_metrics, under a name that differs per platform. These
+# stand in for a column name and are resolved per row.
+_METRIC_LIKES = "metric:likes"
+_METRIC_COMMENTS = "metric:comments"
+
 VIDEO_SORT_COLUMNS = {
-    "Newest first": "video_published_at",
-    "Most viewed": "video_views",
-    "Highest rated": "video_likes",
-    "Highest comments": "video_comment_count",
+    "Newest first": "source_published_at",
+    "Most viewed": "engagement_score",
+    "Highest rated": _METRIC_LIKES,
+    "Highest comments": _METRIC_COMMENTS,
 }
 
 
@@ -82,6 +99,17 @@ def _init_state() -> None:
     st.session_state.setdefault("session_keywords", [])
     st.session_state.setdefault("fetch_error", "")
     st.session_state.setdefault("show_help", False)
+    st.session_state.setdefault("show_usage", False)
+    # What Claude made of a typed request: the filter it implies, and
+    # anything it asked for that a search cannot give.
+    st.session_state.setdefault("intent", {})
+    st.session_state.setdefault("intent_note", "")
+    # Written summaries, keyed by the fingerprint of the set they describe.
+    st.session_state.setdefault("digests", {})
+    # The project currently open, and the saved list as last read.
+    st.session_state.setdefault("open_project", "")
+    st.session_state.setdefault("projects", None)
+    st.session_state.setdefault("project_note", "")
 
 
 def _stamp_refresh() -> None:
@@ -92,6 +120,46 @@ def _stamp_refresh() -> None:
 # enough that reopening the app or refreshing the tab is instant, short enough
 # that a search run in another tab shows up quickly.
 HISTORY_TTL_SECONDS = 60
+
+
+@st.cache_data(ttl=HISTORY_TTL_SECONDS, show_spinner=False)
+def _fetch_projects() -> list:
+    """Saved projects, cached like everything else the Sheet holds."""
+    return sheets_store.load_projects()
+
+
+def _known_projects() -> list:
+    """The projects list, read once per session unless something changed it."""
+    if st.session_state["projects"] is None:
+        st.session_state["projects"] = (
+            _fetch_projects() if sheets_store.is_configured() else []
+        )
+    return st.session_state["projects"]
+
+
+def _remember(project: dict) -> None:
+    """Store a project and put it at the top of the list in hand.
+
+    The copy kept in session carries the same stamps the row does, so the
+    list reads the same before and after a reload.
+    """
+    sheets_store.save_project(project)
+    stamped = dict(projects.from_row(
+        projects.PROJECT_COLUMNS, projects.to_row(project)
+    ) or project)
+    project.update(stamped)
+    _fetch_projects.clear()
+    others = [
+        p for p in (st.session_state["projects"] or [])
+        if p["project_id"] != project["project_id"]
+    ]
+    st.session_state["projects"] = [project] + others
+
+
+@st.cache_data(ttl=HISTORY_TTL_SECONDS, show_spinner=False)
+def _fetch_digests() -> dict:
+    """Stored summaries, cached like the comments themselves."""
+    return sheets_store.load_digests()
 
 
 @st.cache_data(ttl=HISTORY_TTL_SECONDS, show_spinner=False)
@@ -121,6 +189,18 @@ def _load_history() -> None:
         with st.spinner("Loading saved comments..."):
             stored = _fetch_history()
         st.session_state["data"] = stored
+        # A fresh load lands on the last thing collected rather than on an
+        # empty page. Anything else stored stays a CSV in Past searches, and
+        # the moment a search runs it takes over.
+        if not st.session_state["session_keywords"]:
+            latest = most_recent_keyword(stored)
+            if latest:
+                st.session_state["session_keywords"] = [latest]
+        # Summaries written in an earlier session, so a refresh does not send
+        # an unchanged set to Claude again.
+        st.session_state["digests"] = {
+            **_fetch_digests(), **st.session_state["digests"]
+        }
         _stamp_refresh()
     except SheetsError as exc:
         _LOG.exception("Loading saved comments failed")
@@ -156,11 +236,25 @@ def _sidebar() -> dict:
     # this names the whole panel and pairs with the Run Search button ending it.
     st.sidebar.header("Start a search")
 
+    # The platform choice lives above the report, not here, because it says
+    # what you are looking at as well as what to collect. This panel only
+    # shows the options that apply to what is selected.
+    platforms = chosen_platforms()
+    youtube_on = YOUTUBE in platforms
+    reddit_on = REDDIT in platforms
+
     # The box and the button share a form so that Enter in the box runs the
     # search, which is what the box says it will do. A plain text input only
     # commits its value on Enter; the run itself hung off the button, so the
     # keystroke did nothing visible. A form submits on Enter by design, and
     # the button is that form's submit, so both routes are the same route.
+    # A request typed in full is replaced by the keyword it parsed to, so the
+    # box shows what was actually searched. Written before the widget exists,
+    # which is the only moment its state can be set.
+    filled = st.session_state.pop("pending_keyword", "")
+    if filled:
+        st.session_state["keywords_raw"] = filled
+
     with st.sidebar.form("search_form", border=False, enter_to_submit=True):
         # The box starts empty on purpose. A pre-filled value hides the
         # placeholder, and the placeholder is where the guidance lives:
@@ -168,7 +262,7 @@ def _sidebar() -> dict:
         # and getting nothing, because this searches YouTube for the words as
         # typed rather than interpreting them.
         keywords_raw = st.text_input(
-            "Which keyword do you want to search for on YouTube?",
+            "Which keyword do you want to search for?",
             value="",
             key="keywords_raw",
             placeholder="Khakra, GO DESi",
@@ -178,22 +272,49 @@ def _sidebar() -> dict:
                 "feedback type is coming with paid plans."
             ),
         )
-        exclude_raw = st.text_input(
-            "Exclude keywords",
-            value="",
-            key="exclude_raw",
-            placeholder="recipe, how to make",
-            help=(
-                "Optional. Videos whose title or description contains any of "
-                "these are skipped. Separate several with commas, the same as "
-                "above."
-            ),
-        )
+        exclude_raw = ""
+        if youtube_on:
+            exclude_raw = st.text_input(
+                "Exclude keywords (YouTube)",
+                value="",
+                key="exclude_raw",
+                placeholder="recipe, how to make",
+                help=(
+                    "Optional, and YouTube only. Videos whose title or "
+                    "description contains any of these are skipped. Reddit "
+                    "results are filtered by reading them instead."
+                ),
+            )
         run = st.form_submit_button(
             "Run Search", type="primary", width="stretch"
         )
     keywords = parse_keywords(keywords_raw)
     exclude = parse_keywords(exclude_raw)
+
+    if not platforms:
+        st.sidebar.warning(
+            "No platform is selected. Pick one above the report.",
+            icon=":material/warning:",
+        )
+
+    if reddit_on:
+        _reddit_notes()
+
+    if not youtube_on:
+        # Reddit alone: none of what follows applies to it, so none of it is
+        # shown. Defaults stand in for the values the config still carries.
+        past_slot = st.sidebar.container()
+        _help_section()
+        return {
+            "platforms": platforms, "keywords": keywords, "exclude": [],
+            "run": run, "past_slot": past_slot,
+            "match": youtube_fetcher.MATCH_ALL,
+            "order_label": list(ORDER_OPTIONS)[0],
+            "order": "relevance",
+            "videos_per_keyword": DEFAULT_VIDEOS_PER_KEYWORD,
+            "published_after": None,
+            "include_replies": True,
+        }
 
     # A radio rather than a segmented control: these labels are sentences, and
     # a stretched segmented control in a narrow sidebar wraps them into ragged
@@ -232,9 +353,35 @@ def _sidebar() -> dict:
     _help_section()
 
     return {
-        "keywords": keywords, "exclude": exclude, "run": run,
-        "past_slot": past_slot, "match": match, **options,
+        "platforms": platforms, "keywords": keywords, "exclude": exclude,
+        "run": run, "past_slot": past_slot, "match": match, **options,
     }
+
+
+def _reddit_notes() -> None:
+    """What Reddit collection costs and how its results are filtered."""
+    queries = relevance.DEFAULT_VARIANTS if relevance.is_configured() else 1
+    cost = queries * reddit_fetcher.COST_PER_QUERY_USD
+    searches = int(reddit_fetcher.MONTHLY_CREDIT_USD / cost) if cost else 0
+    st.sidebar.caption(
+        f"Reddit: up to {reddit_fetcher.POSTS_PER_QUERY} posts per query, "
+        f"{queries} quer{'y' if queries == 1 else 'ies'} per search. That is "
+        f"about ${cost:.2f} a search, or roughly {searches:,} searches a "
+        "month within the plan's credit."
+    )
+    if relevance.is_configured():
+        st.sidebar.caption(
+            f"Your keyword is searched {relevance.DEFAULT_VARIANTS} ways, "
+            "aimed at food, and posts about something else that shares the "
+            "word are read and dropped."
+        )
+    else:
+        st.sidebar.warning(
+            "Reddit is searched site-wide and its search is loose. Without an "
+            "Anthropic key the results cannot be filtered, so expect posts "
+            "that only share the word.",
+            icon=":material/warning:",
+        )
 
 
 # The manual is a page of its own, not a dialog: it is long enough to read
@@ -244,15 +391,20 @@ def _sidebar() -> dict:
 # It is laid out as cards across the full width. One narrow column of prose
 # down the middle of a wide monitor wastes most of the screen and turns a
 # five minute read into a long scroll.
-def _help_back(key: str, kind: str = "secondary") -> None:
+def _back_button(key: str, flag: str, kind: str = "secondary") -> None:
+    """The way out of a full-page view, shared by all of them."""
     if st.button(
         "Back to the app",
         icon=":material/arrow_back:",
         key=key,
         type=kind,
     ):
-        st.session_state["show_help"] = False
+        st.session_state[flag] = False
         st.rerun()
+
+
+def _help_back(key: str, kind: str = "secondary") -> None:
+    _back_button(key, "show_help", kind)
 
 
 def _help_card(column, title: str, body: str) -> None:
@@ -565,8 +717,178 @@ def _help_page() -> None:
     _help_back("help_back_bottom", "primary")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _apify_account() -> dict:
+    """Apify's own numbers. It publishes them, so they are pulled, not counted."""
+    try:
+        client = reddit_fetcher.build_client()
+        limits = client.user("me").limits()
+        data = limits if isinstance(limits, dict) else limits.model_dump()
+        cycle = data.get("monthly_usage_cycle", {})
+        runs = client.actor(reddit_fetcher.ACTOR).runs().list(limit=200).items
+        start = str(cycle.get("start_at", ""))[:10]
+        this_cycle = [r for r in runs if str(r.started_at)[:10] >= start]
+        return {
+            "ok": True,
+            "used": float(data.get("current", {}).get("monthly_usage_usd", 0)),
+            "limit": float(data.get("limits", {}).get("max_monthly_usage_usd", 0)),
+            "cycle_start": start,
+            "cycle_end": str(cycle.get("end_at", ""))[:10],
+            "runs": len(this_cycle),
+            "spent_on_runs": sum(
+                float(getattr(r, "usage_total_usd", 0) or 0) for r in this_cycle
+            ),
+        }
+    except Exception as exc:
+        _LOG.warning("Could not read the Apify account: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def _usage_page() -> None:
+    """Live operational numbers, for whoever runs this.
+
+    Each section says where its number comes from, because they do not come
+    from the same kind of place: one is published by the provider, two are
+    counted by this app because the provider does not publish them.
+    """
+    _back_button("usage_back_top", "show_usage", "primary")
+
+    st.title("Usage")
+    st.caption(
+        "Internal. API spend and quota for whoever administers this app, not "
+        "something a person searching comments needs to see."
+    )
+    st.divider()
+
+    log = sheets_store.load_usage() if sheets_store.is_configured() else []
+
+    # ---- YouTube ------------------------------------------------------
+    st.header("YouTube quota", anchor="youtube")
+    today = usage.summarise(log, since=usage.today(), service=usage.YOUTUBE)
+    used = int(today["units"])
+    left = max(usage.YOUTUBE_DAILY_LIMIT - used, 0)
+    one, two, three = st.columns(3)
+    one.metric("Units used today", f"{used:,}")
+    two.metric("Of the daily limit", f"{usage.YOUTUBE_DAILY_LIMIT:,}")
+    three.metric("Units left", f"{left:,}")
+    st.progress(min(used / usage.YOUTUBE_DAILY_LIMIT, 1.0))
+    st.caption(
+        ":gray[Counted by this app, from the calls it makes, priced at "
+        "YouTube's published costs: 100 units a search page, 1 a batched "
+        "video-details call, 1 a page of comments. The Data API does not "
+        "report usage, and the Cloud Monitoring metric that would is refused "
+        "to this service account, so counting the calls is the accurate "
+        "number rather than an estimate of one. Quota resets at midnight "
+        "Pacific.]"
+    )
+    if today["by_action"]:
+        st.caption(
+            "Today: " + ", ".join(
+                f"{name} {int(v['units']):,} units"
+                for name, v in sorted(today["by_action"].items())
+            )
+        )
+
+    # ---- Apify --------------------------------------------------------
+    st.divider()
+    st.header("Apify", anchor="apify")
+    account = _apify_account()
+    if not account.get("ok"):
+        st.warning(f"Could not reach the Apify account: {account.get('error', '')}")
+    else:
+        left_usd = max(account["limit"] - account["used"], 0)
+        one, two, three = st.columns(3)
+        one.metric("Spent this cycle", f"${account['used']:.2f}")
+        two.metric("Plan credit", f"${account['limit']:.2f}")
+        three.metric("Reddit searches", f"{account['runs']:,}")
+        st.progress(min(account["used"] / max(account["limit"], 1), 1.0))
+        st.caption(
+            f":gray[Pulled live from Apify, which publishes account spend. "
+            f"Cycle {account['cycle_start']} to {account['cycle_end']}, "
+            f"${left_usd:.2f} left. The searches figure counts actor runs in "
+            f"this cycle, ${account['spent_on_runs']:.2f} of the total.]"
+        )
+
+    # ---- Claude -------------------------------------------------------
+    st.divider()
+    st.header("Claude", anchor="claude")
+    claude = usage.summarise(log, service=usage.CLAUDE)
+    cycle_start = (account.get("cycle_start") or "") if account.get("ok") else ""
+    this_cycle = usage.summarise(log, since=cycle_start, service=usage.CLAUDE)
+    one, two, three = st.columns(3)
+    one.metric("Since the log began", f"${claude['cost']:.2f}")
+    two.metric("This cycle", f"${this_cycle['cost']:.2f}")
+    three.metric("Calls", f"{claude['events']:,}")
+    st.warning(
+        "This is a running total this app keeps itself, not a live figure "
+        "from Anthropic. Anthropic's usage and cost reports need an Admin API "
+        "key, which this app's key is refused for, so account spend cannot be "
+        "read. Each call is priced from the token counts it returns, at the "
+        "model's published rates, and summed. It counts only what this app "
+        "spends: anything else on the same key is invisible here.",
+        icon=":material/info:",
+    )
+    if claude["by_action"]:
+        rows = pd.DataFrame(
+            [
+                {
+                    "Feature": name,
+                    "Calls": int(v["events"]),
+                    "Tokens": int(v["units"]),
+                    "Cost": f"${v['cost']:.4f}",
+                }
+                for name, v in sorted(
+                    claude["by_action"].items(), key=lambda kv: -kv[1]["cost"]
+                )
+            ]
+        )
+        st.dataframe(rows, width="stretch", hide_index=True)
+    rates = ", ".join(
+        f"{model} ${p['input']:.2f} in / ${p['output']:.2f} out per million"
+        for model, p in usage.PRICING.items()
+        if model == relevance.MODEL
+    )
+    st.caption(f":gray[Priced at {rates}.]")
+
+    # ---- Translation --------------------------------------------------
+    st.divider()
+    st.header("Translation", anchor="translation")
+    month = usage.summarise(log, since=usage.month_start(), service=usage.TRANSLATE)
+    chars = int(month["units"])
+    left_chars = max(usage.TRANSLATE_FREE_CHARS - chars, 0)
+    low, high = usage.COMMENT_CHARS
+    one, two, three = st.columns(3)
+    one.metric("Characters this month", f"{chars:,}")
+    two.metric("Free tier", f"{usage.TRANSLATE_FREE_CHARS:,}")
+    three.metric("Characters left", f"{left_chars:,}")
+    st.progress(min(chars / usage.TRANSLATE_FREE_CHARS, 1.0))
+    st.caption(
+        f"Roughly {left_chars // high:,} to {left_chars // low:,} more "
+        f"comments this month, at {low} to {high} characters each. "
+        f"{month['events']:,} call(s) so far."
+    )
+    st.warning(
+        "This is a running total this app keeps itself, not a live figure "
+        "from Google. Translation usage is not readable with the credentials "
+        "here: Cloud Monitoring and Service Usage both refuse this service "
+        "account, and the Cloud Billing API is not enabled on the project. "
+        "Characters are counted as they are sent, which is how Google bills "
+        "them. The free tier resets on the first of the month.",
+        icon=":material/info:",
+    )
+
+    if not log:
+        st.info(
+            "Nothing logged yet. The counters fill as searches, "
+            "classification and summaries run."
+        )
+
+    st.divider()
+    _back_button("usage_back_bottom", "show_usage", "primary")
+
+
 def _help_section() -> None:
-    """The way into the help, at the bottom of the sidebar."""
+    """The two pages out of the app, as a pair at the bottom of the sidebar."""
     st.sidebar.divider()
     if st.sidebar.button(
         "How it works",
@@ -575,6 +897,18 @@ def _help_section() -> None:
         key="how_it_works",
     ):
         st.session_state["show_help"] = True
+        st.rerun()
+
+    # Directly below and the same shape, but secondary: this one is for
+    # whoever runs the app, not for the person using it.
+    if st.sidebar.button(
+        "Usage",
+        icon=":material/monitoring:",
+        use_container_width=True,
+        key="show_usage_button",
+        help="Live API spend and quota. For whoever administers this app.",
+    ):
+        st.session_state["show_usage"] = True
         st.rerun()
 
     if not sheets_store.is_configured():
@@ -669,6 +1003,165 @@ def _search_options() -> dict:
 # The search run
 # --------------------------------------------------------------------------
 def _run_search(config: dict) -> None:
+    """One search action, however many platforms are selected.
+
+    Each platform collects on its own terms and the rows are stored together,
+    so one run produces one summary and one report rather than two of each.
+    """
+    platforms = config.get("platforms") or []
+    if not platforms:
+        st.warning("Select at least one platform above the report.")
+        return
+    if not config["keywords"]:
+        st.warning("Enter at least one keyword to search.")
+        return
+
+    config = _understand_request(config)
+    if not config["keywords"]:
+        return
+
+    collected: list[dict] = []
+    reports = []
+    extras = {"excluded": 0, "irrelevant": 0, "off_topic_posts": 0}
+
+    if YOUTUBE in platforms:
+        result = _youtube_rows(config)
+        if result is not None:
+            rows, report = result
+            collected.extend(rows)
+            reports.append(report)
+            extras["excluded"] += report.videos_excluded
+            extras["irrelevant"] += report.videos_irrelevant
+
+    if REDDIT in platforms:
+        result = _reddit_rows(config)
+        if result is not None:
+            rows, report = result
+            collected.extend(rows)
+            reports.append(report)
+            extras["off_topic_posts"] += report.posts_off_topic
+
+    if not reports:
+        return
+
+    merged = youtube_fetcher.FetchReport()
+    for report in reports:
+        merged.videos_searched += report.videos_searched
+        merged.videos_with_comments += report.videos_with_comments
+        merged.comments_fetched += report.comments_fetched
+        merged.quota_exhausted = merged.quota_exhausted or report.quota_exhausted
+        for warning in report.warnings:
+            merged.warn(warning)
+
+    if not collected:
+        st.info("Nothing came back. Try a different keyword.")
+        return
+
+    # Scope the report to what the rows actually say they are filed under, not
+    # to what was typed. Matching all together files them under the joined
+    # query, so using the typed keywords would leave the report empty.
+    filed = list(dict.fromkeys(str(row.get("keyword", "")) for row in collected))
+    _save_rows(collected, merged, [f for f in filed if f], extras)
+
+
+def _understand_request(config: dict) -> dict:
+    """Turn a typed request into a keyword, and note what it also asked for.
+
+    Only runs when the text reads as a request rather than a name, so an
+    ordinary search never pays for it. Whatever it cannot do is said plainly
+    rather than silently dropped.
+    """
+    st.session_state["intent"] = {}
+    st.session_state["intent_note"] = ""
+
+    raw = " ".join(config["keywords"])
+    if not relevance.is_configured() or not relevance.looks_like_a_request(raw):
+        return config
+
+    with st.spinner("Reading your request..."):
+        read = relevance.understand(raw)
+    if not read["parsed"]:
+        return config
+
+    keyword = read["keyword"].strip()
+    if not keyword:
+        st.warning(
+            f"Could not find a product or brand name in {raw!r}. Try the name "
+            "on its own."
+        )
+        config = dict(config)
+        config["keywords"] = []
+        return config
+
+    config = dict(config)
+    config["keywords"] = parse_keywords(keyword)
+    # Fill the box with it on the next run, so what is on screen is what ran.
+    st.session_state["pending_keyword"] = keyword
+
+    intent = {k: read[k] for k in ("sentiment", "kind") if read[k]}
+    if intent:
+        st.session_state["intent"] = {**intent, "raw": raw}
+
+    parts = [f"Searched for **{keyword}**."]
+    if intent:
+        parts.append(
+            "Wanted: " + " and ".join(f"{v} {k}" for k, v in intent.items()) + "."
+        )
+    if read["unfulfilled"]:
+        parts.append(f"Cannot do: {read['unfulfilled'].rstrip('.')}.")
+    st.session_state["intent_note"] = " ".join(parts)
+    return config
+
+
+def _intent_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply a sentiment or kind the request asked for, when it can be.
+
+    Those labels come from classification, so they cannot narrow comments
+    nobody has read yet. When none of what is in view is labelled, the filter
+    is not silently skipped: it says what it is waiting for.
+    """
+    intent = st.session_state.get("intent") or {}
+    wanted = {k: v for k, v in intent.items() if k in ("sentiment", "kind")}
+    if df.empty or not wanted:
+        return df
+
+    asked = " and ".join(f"{value} {name}" for name, value in wanted.items())
+    labelled = classify.ensure_columns(df)
+    known = labelled[labelled[classify.KIND_COLUMN] != ""]
+
+    if known.empty:
+        st.info(
+            f"You asked for {asked}, which comes from classifying the "
+            "comments. None of these have been classified yet, so this is "
+            "every comment for the keyword. Press Classify below, then the "
+            "filter applies itself.",
+            icon=":material/info:",
+        )
+        return df
+
+    keep = known
+    for name, value in wanted.items():
+        column = (classify.SENTIMENT_COLUMN if name == "sentiment"
+                  else classify.KIND_COLUMN)
+        keep = keep[keep[column] == value]
+
+    unread = len(labelled) - len(known)
+    line = f"Showing {len(keep):,} {asked} comment(s)."
+    if unread:
+        line += (
+            f" {unread:,} more have not been classified yet and are not "
+            "counted; press Classify below to include them."
+        )
+    left, right = st.columns([4, 1], vertical_alignment="center")
+    left.caption(line)
+    if right.button("Clear filter", key="clear_intent", width="stretch"):
+        st.session_state["intent"] = {}
+        st.rerun()
+    return keep
+
+
+def _youtube_rows(config: dict):
+    """Search YouTube and read the comments. None when it could not run."""
     api_key = str(st.secrets.get("YOUTUBE_API_KEY", "")).strip()
     if not api_key:
         st.error(
@@ -676,11 +1169,7 @@ def _run_search(config: dict) -> None:
             "`.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` "
             "and add your key."
         )
-        return
-
-    if not config["keywords"]:
-        st.warning("Enter at least one keyword to search.")
-        return
+        return None
 
     progress = st.progress(0.0)
     status = st.empty()
@@ -688,6 +1177,16 @@ def _run_search(config: dict) -> None:
     def on_progress(current: int, total: int, label: str) -> None:
         progress.progress(min(1.0, current / max(total, 1)))
         status.markdown(f"{label}")
+
+    # The same expansion Reddit uses, read here as context rather than as
+    # extra queries: it says which sense of a generic name was meant, and the
+    # strict filter then requires the video to carry that sense too.
+    context = []
+    if relevance.is_configured() and len(config["keywords"]) == 1:
+        variants = relevance.expand_keyword(config["keywords"][0])
+        context = youtube_fetcher.context_terms(config["keywords"], variants)
+        if context:
+            _LOG.info("YouTube relevance context: %s", context)
 
     try:
         videos, report = youtube_fetcher.find_videos(
@@ -698,23 +1197,24 @@ def _run_search(config: dict) -> None:
             published_after=config["published_after"],
             match=config["match"],
             exclude=config["exclude"],
+            context=context,
             progress_cb=on_progress,
         )
     except InvalidAPIKeyError as exc:
         progress.empty()
         status.empty()
         st.error(str(exc))
-        return
+        return None
     except QuotaExceededError as exc:
         progress.empty()
         status.empty()
         st.error(str(exc))
-        return
+        return None
     except YouTubeError as exc:
         progress.empty()
         status.empty()
         st.error(f"Search failed: {exc}")
-        return
+        return None
 
     st.session_state["last_report"] = report
 
@@ -740,17 +1240,20 @@ def _run_search(config: dict) -> None:
         elif report.videos_irrelevant:
             st.info(
                 f"{report.videos_irrelevant:,} video(s) came back, but none "
-                "of them mentioned your keywords in the title or "
-                "description, so none were read. Try a shorter keyword, or "
-                "match any of them instead of all together."
+                "passed the relevance check: your keyword was missing from "
+                "the title and description, or appeared with nothing to say "
+                "it was about food. Try a more specific keyword, or match any "
+                "of them instead of all together."
             )
-        else:
+        elif YOUTUBE in (config.get("platforms") or []) and len(
+            config.get("platforms") or []
+        ) == 1:
             st.info("No videos matched. Try a different keyword.")
-        return
+        return None
 
     # Straight on to the comments, reusing the same progress bar so the run
     # reads as one continuous job rather than two.
-    _fetch_and_save(
+    rows, comment_report = _fetch_comments(
         videos,
         {
             # What the rows are filed under: the queries actually sent, which
@@ -759,8 +1262,6 @@ def _run_search(config: dict) -> None:
                 config["keywords"], config["match"]
             ),
             "include_replies": config["include_replies"],
-            "excluded": report.videos_excluded,
-            "irrelevant": report.videos_irrelevant,
         },
         on_progress,
     )
@@ -768,9 +1269,67 @@ def _run_search(config: dict) -> None:
     progress.empty()
     status.empty()
 
+    if rows is None:
+        return None
+    spent = report.quota_units + comment_report.quota_units
+    usage.record_youtube(spent, "search", ", ".join(config["keywords"])[:80])
+    # The counts belong to the search half; the comments half knows nothing
+    # about what was filtered out before it ran.
+    comment_report.videos_excluded = report.videos_excluded
+    comment_report.videos_irrelevant = report.videos_irrelevant
+    return rows, comment_report
 
-def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
-    """Pull the comments for every video the search found, then store them."""
+
+def _reddit_rows(config: dict):
+    """Search Reddit and read the posts. None when it could not run.
+
+    One actor call per query brings back posts with their comments already
+    attached, so there is no separate comment fetch.
+    """
+    if not reddit_fetcher.is_configured():
+        st.error(
+            f"No `{reddit_fetcher.SECRET_TOKEN}` found in secrets, so Reddit "
+            "cannot be searched."
+        )
+        return None
+
+    keyword = config["keywords"][0] if config["keywords"] else ""
+    if not keyword:
+        return None
+
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    def on_progress(current: int, total: int, label: str) -> None:
+        progress.progress(min(1.0, current / max(total, 1)))
+        status.markdown(label)
+
+    try:
+        rows, report = reddit_fetcher.fetch(
+            keyword=keyword,
+            max_posts=reddit_fetcher.POSTS_PER_QUERY,
+            progress_cb=on_progress,
+        )
+    except reddit_fetcher.RedditError as exc:
+        progress.empty()
+        status.empty()
+        _LOG.exception("Reddit search failed")
+        st.error(str(exc))
+        return None
+    finally:
+        progress.empty()
+        status.empty()
+
+    if report.warnings:
+        with st.expander(f"{len(report.warnings)} notice(s) from Reddit"):
+            for warning in report.warnings:
+                st.write(f"- {warning}")
+
+    return rows, report
+
+
+def _fetch_comments(videos: list[dict], config: dict, on_progress):
+    """Pull the comments for every video the search found. None on failure."""
     api_key = str(st.secrets.get("YOUTUBE_API_KEY", "")).strip()
 
     try:
@@ -783,8 +1342,19 @@ def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
         )
     except (InvalidAPIKeyError, QuotaExceededError, YouTubeError) as exc:
         st.session_state["fetch_error"] = str(exc)
-        return
+        return None, None
 
+    return rows, report
+
+
+def _save_rows(
+    rows: list[dict], report, keywords: Sequence[str], extras: dict
+) -> None:
+    """Store fetched rows and record the run, whatever platform they came from.
+
+    Everything here works on the shared schema, so auto-save, the keyword
+    retention limit and the run summary behave the same for both platforms.
+    """
     added = _merge(rows)
     st.session_state["last_report"] = report
     _stamp_refresh()
@@ -810,14 +1380,14 @@ def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
                     # search that finds no new comments still counts as a
                     # fresh search, and that is what keeps it out of the
                     # cleanup that follows.
-                    sheets_store.record_search(config["keywords"])
+                    sheets_store.record_search(keywords)
                     retired = sheets_store.apply_retention()
                 if retired:
                     _fetch_history.clear()
             except SheetsError as exc:
                 _LOG.exception("Keeping the Sheet to its keyword limit failed")
 
-    for keyword in config["keywords"]:
+    for keyword in keywords:
         if keyword not in st.session_state["session_keywords"]:
             st.session_state["session_keywords"].append(keyword)
 
@@ -826,9 +1396,10 @@ def _fetch_and_save(videos: list[dict], config: dict, on_progress) -> None:
         "videos": report.videos_with_comments or report.videos_searched,
         "added": added,
         "written": written,
-        "keywords": list(config["keywords"]),
-        "excluded": int(config.get("excluded", 0)),
-        "irrelevant": int(config.get("irrelevant", 0)),
+        "keywords": list(keywords),
+        "excluded": int(extras.get("excluded", 0)),
+        "irrelevant": int(extras.get("irrelevant", 0)),
+        "off_topic_posts": int(extras.get("off_topic_posts", 0)),
         "retired": retired,
         "ids": {str(row.get("comment_id", "")) for row in rows},
     }
@@ -874,6 +1445,13 @@ def _run_summary() -> None:
             "appear in the title or description."
         )
 
+    not_food = int(last.get("off_topic_posts", 0))
+    if not_food:
+        st.caption(
+            f"{not_food:,} post(s) dropped after reading them: they turned "
+            "out to be about something else that shares your keyword."
+        )
+
     retired = last.get("retired") or {}
     if retired:
         names = ", ".join(sorted(retired))
@@ -908,7 +1486,101 @@ MATCH_HELP = (
     "precise results."
 )
 
-BY_VIDEO_VIEW = "Report by video"
+YOUTUBE = "YouTube"
+REDDIT = "Reddit"
+PLATFORM_LABELS = {
+    YOUTUBE: youtube_fetcher.PLATFORM_YOUTUBE,
+    REDDIT: reddit_fetcher.PLATFORM,
+}
+
+# What one source is called on each platform, for a report that holds both.
+SOURCE_NOUN = {
+    youtube_fetcher.PLATFORM_YOUTUBE: "Video",
+    reddit_fetcher.PLATFORM: "Post",
+}
+
+# Where the platform choice lives. Read before the widget is drawn, because
+# the search runs earlier in the script than the results area it sits in.
+PLATFORM_KEY = "platforms"
+
+
+def chosen_platforms() -> list[str]:
+    """The platforms selected, both by default."""
+    picked = st.session_state.get(PLATFORM_KEY)
+    if picked is None:
+        return list(PLATFORM_LABELS)
+    return [p for p in PLATFORM_LABELS if p in picked]
+
+
+def _search_budget_line() -> None:
+    """One muted line about how many more searches the plan will carry.
+
+    A reminder, not an alert: it sits above the report in ordinary use and
+    says nothing louder than a caption. The spend behind it is pulled live
+    from Apify; the per-search figure is the same one the Usage page uses.
+    """
+    if not reddit_fetcher.is_configured():
+        return
+    account = _apify_account()
+    if not account.get("ok"):
+        return
+
+    queries = relevance.DEFAULT_VARIANTS if relevance.is_configured() else 1
+    per_search = queries * reddit_fetcher.COST_PER_QUERY_USD
+    used = account["runs"] // max(queries, 1)
+    left = int(max(account["limit"] - account["used"], 0) / max(per_search, 0.0001))
+    st.caption(
+        f":gray[{used:,} search(es) with Reddit this cycle, about {left:,} "
+        f"more before the plan's credit runs out at roughly "
+        f"${per_search:.2f} each.]"
+    )
+
+
+def _platform_picker() -> list[str]:
+    """The top control of the results area: which platforms to search and show."""
+    # Only supply the default when nothing is stored. Passing both a default
+    # and a session value is what Streamlit warns about, and opening a saved
+    # keyword or a project sets that value.
+    default = (
+        {} if PLATFORM_KEY in st.session_state
+        else {"default": list(PLATFORM_LABELS)}
+    )
+    picked = st.multiselect(
+        "Platforms",
+        list(PLATFORM_LABELS),
+        key=PLATFORM_KEY,
+        **default,
+        label_visibility="collapsed",
+        placeholder="Choose at least one platform",
+        help=(
+            "What Run Search collects, and what the report below shows. "
+            "Both are searched unless you narrow it."
+        ),
+    )
+    return [p for p in PLATFORM_LABELS if p in (picked or [])]
+
+BY_VIDEO_VIEW = "Report by source"
+BY_KIND_VIEW = "Report by kind"
+ANALYSIS_VIEW = "Analysis"
+PROJECTS_VIEW = "My projects"
+
+# Sentiment is a polarity, so it takes the diverging pair: two opposed hues
+# with a neutral gray in the middle. Kind is identity, so it takes categorical
+# slots in a fixed order, which never shifts when a bucket is missing.
+# Both were run through the palette validator; the gray midpoint is the
+# diverging rule rather than a failed categorical slot.
+SENTIMENT_COLOURS = {
+    "positive": "#2a78d6",
+    "neutral": "#898781",
+    "negative": "#d03b3b",
+}
+KIND_COLOURS = {
+    "question": "#2a78d6",
+    "compliment": "#1baf7a",
+    "complaint": "#d03b3b",
+    "suggestion": "#eda100",
+    "other": "#898781",
+}
 ALL_COMMENTS_VIEW = "Report by all comments"
 
 ALL_TYPES = "All"
@@ -930,23 +1602,29 @@ RAW_TABLE_COLUMNS = [
     "comment_author",
     "comment_likes",
     "comment_published_at",
-    "video_title",
-    "channel_title",
-    "video_views",
-    "video_comment_count",
+    "kind",
+    "sentiment",
+    "source_title",
+    "channel_or_subreddit",
+    "platform",
+    "engagement_score",
     "video_type",
-    "video_published_at",
-    "video_url",
+    "source_published_at",
+    "source_url",
 ]
 
 RAW_TABLE_CONFIG = {
     "keyword": ("Keyword", "small"),
+    "kind": ("Kind", "small"),
+    "sentiment": ("Sentiment", "small"),
+    "platform": ("Platform", "small"),
+    "engagement_score": ("Reach", "small"),
     "comment_text": ("Comment", "large"),
     "comment_translation": ("Translation", "large"),
     "comment_language": ("Lang", "small"),
     "comment_author": ("Author", "small"),
-    "video_title": ("Video", "medium"),
-    "channel_title": ("Channel", "small"),
+    "source_title": ("Video", "medium"),
+    "channel_or_subreddit": ("Channel", "small"),
     "video_type": ("Type", "small"),
 }
 
@@ -1049,6 +1727,535 @@ def _translate_button(
 SHOW_BOTH = "Both"
 SHOW_ORIGINAL = "Original"
 SHOW_TRANSLATION = "Translation"
+
+
+# Said beside the progress bar while it runs, and promised beside the button
+# before it starts, because the moment someone needs to know is before they
+# wander off.
+CLASSIFY_WARNING = (
+    "Do not switch tabs or navigate away while this runs. Leaving the page "
+    "stops it partway. Everything classified up to that point is saved, and "
+    "pressing Classify comments again resumes from there, so nothing is read "
+    "or charged for twice."
+)
+
+
+def _classify_section(df: pd.DataFrame) -> None:
+    """The Classify action, scoped to exactly what is on screen.
+
+    Never automatic and never the whole Sheet: it reads the frame the filters
+    above have already narrowed, so the cost is the cost of what you can see.
+    """
+    if not classify.is_configured() or df.empty:
+        return
+
+    pending = classify.pending_ids(df)
+    if not pending:
+        return
+
+    batches = -(-len(pending) // classify.BATCH_SIZE)
+    left, right = st.columns([2, 3], vertical_alignment="center")
+    with left:
+        pressed = st.button(
+            f"Classify {len(pending):,} comment(s)",
+            key="classify_now",
+            icon=":material/label:",
+            help=(
+                "Reads each comment and labels what it is and how it reads. "
+                "Only the comments in view, and only ones not done already. "
+                + CLASSIFY_WARNING
+            ),
+        )
+    with right:
+        st.caption(
+            f":gray[Sends these {len(pending):,} comment(s) to Claude in "
+            f"{batches} batch(es). Each is read once and the labels are kept, "
+            "so this is not repeated. Stay on this page while it runs: "
+            "leaving stops it, though anything done is saved and pressing "
+            "Classify again resumes from there.]"
+        )
+
+    if not pressed:
+        return
+
+    # Beside the bar, not above the button: this is the thing to read while
+    # it is running. The rerun at the end clears it.
+    st.warning(CLASSIFY_WARNING, icon=":material/hourglass_top:")
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    def on_progress(done_batches: int, total: int, done_rows: int) -> None:
+        progress.progress(min(1.0, done_batches / max(total, 1)))
+        status.markdown(
+            f"Labelled {done_rows:,} of {len(pending):,} comment(s)..."
+        )
+
+    try:
+        with st.spinner("Reading the comments..."):
+            updated, done, problems = classify.classify_rows(
+                insights.ensure_columns(st.session_state["data"]),
+                pending,
+                progress_cb=on_progress,
+            )
+    except classify.ClassifyError as exc:
+        progress.empty()
+        status.empty()
+        _LOG.exception("Classification failed")
+        st.session_state["insight_status"] = f"Classification failed: {exc}"
+        st.rerun()
+        return
+    finally:
+        progress.empty()
+        status.empty()
+
+    st.session_state["data"] = updated
+
+    saved = ""
+    if done and sheets_store.is_configured():
+        try:
+            touched = updated[updated["comment_id"].astype(str).isin(pending)]
+            with st.spinner("Saving the labels..."):
+                sheets_store.update_analysis(touched)
+            _fetch_history.clear()
+        except SheetsError as exc:
+            _LOG.exception("Saving the labels failed")
+            saved = f" They could not be saved: {exc}"
+
+    left_over = len(pending) - done
+    note = f"Labelled {done:,} comment(s)."
+    if left_over:
+        note += (
+            f" {left_over:,} could not be read and are still waiting; run it "
+            "again to pick up only those."
+        )
+    st.session_state["insight_status"] = note + saved
+    st.rerun()
+
+
+def _save_project(df: pd.DataFrame, config: dict) -> None:
+    """Name the search that produced what is on screen.
+
+    Stores the definition, never the rows: reopening it asks the comments
+    table the same question again.
+    """
+    if not sheets_store.is_configured() or df.empty:
+        return
+
+    open_id = st.session_state["open_project"]
+    current = next(
+        (p for p in _known_projects() if p["project_id"] == open_id), None
+    )
+
+    with st.expander(
+        f"Project: {current['name']}" if current else "Save as project",
+        expanded=False,
+        icon=":material/bookmark:",
+    ):
+        with st.form("project_form", border=False):
+            name = st.text_input(
+                "Project name",
+                value=current["name"] if current else "",
+                placeholder="Chikki category perception",
+                help=(
+                    "Saves what defines this search: its keywords and "
+                    "platforms. The comments stay where they are."
+                ),
+            )
+            keywords = st.session_state["session_keywords"] or config["keywords"]
+            platforms = [PLATFORM_LABELS[p] for p in config.get("platforms", [])]
+            st.caption(
+                f":gray[Keywords: {', '.join(keywords) or 'none'} - "
+                f"platforms: {', '.join(platforms) or 'none'}]"
+            )
+            if not st.form_submit_button(
+                "Update project" if current else "Save as project",
+                type="primary", width="stretch",
+            ):
+                return
+
+        if not name.strip():
+            st.warning("Give the project a name.")
+            return
+
+        project = {
+            "project_id": (
+                current["project_id"] if current else projects.new_id(name)
+            ),
+            "name": name.strip(),
+            "keywords": list(keywords),
+            "platforms": platforms,
+            "exclude": list(config.get("exclude") or []),
+            "match": config.get("match", ""),
+            "created_at": current["created_at"] if current else "",
+            "snapshot": projects.snapshot(df),
+        }
+        try:
+            _remember(project)
+        except SheetsError as exc:
+            _LOG.exception("Saving the project failed")
+            st.error(f"Could not save the project: {exc}")
+            return
+
+        st.session_state["open_project"] = project["project_id"]
+        st.session_state["project_note"] = f"Saved {project['name']}."
+        st.rerun()
+
+
+def _open_project(project: dict) -> None:
+    """Ask for a project to be opened on the next run.
+
+    The platform picker and the view toggle are widgets that have already been
+    drawn by the time a project is clicked, and Streamlit forbids writing a
+    widget's state after it exists. So the request is parked and applied at
+    the top of the next run, before any of them are made.
+    """
+    st.session_state["pending_open"] = {
+        "project_id": project["project_id"],
+        "keywords": list(project["keywords"]),
+        "platforms": [
+            label for label, value in PLATFORM_LABELS.items()
+            if value in project["platforms"]
+        ],
+    }
+
+
+def _apply_pending_open() -> None:
+    """Put a requested project into effect, before any widget is drawn."""
+    waiting = st.session_state.pop("pending_open", None)
+    if not waiting:
+        return
+    st.session_state["open_project"] = waiting["project_id"]
+    st.session_state["session_keywords"] = list(waiting["keywords"])
+    if waiting["platforms"]:
+        st.session_state[PLATFORM_KEY] = waiting["platforms"]
+    st.session_state["main_view"] = BY_VIDEO_VIEW
+    st.session_state["comment_search"] = ""
+    st.session_state["intent"] = {}
+
+
+def _refresh_project(project: dict) -> None:
+    """Run the project's search again and say what changed.
+
+    Deliberate: it costs a search. Everything else about it is the ordinary
+    path, so dedupe, auto-save and the keyword limit all apply as usual.
+    """
+    before = dict(project.get("snapshot") or {})
+    if not before:
+        before = projects.snapshot(
+            projects.rows_for(
+                insights.ensure_columns(st.session_state["data"]), project
+            )
+        )
+
+    config = {
+        "platforms": [
+            label for label, value in PLATFORM_LABELS.items()
+            if value in project["platforms"]
+        ] or list(PLATFORM_LABELS),
+        "keywords": list(project["keywords"]),
+        "exclude": list(project.get("exclude") or []),
+        "match": project.get("match") or youtube_fetcher.MATCH_ALL,
+        "order": "relevance",
+        "order_label": list(ORDER_OPTIONS)[0],
+        "videos_per_keyword": DEFAULT_VIDEOS_PER_KEYWORD,
+        "published_after": None,
+        "include_replies": True,
+    }
+    _run_search(config)
+
+    after_rows = projects.rows_for(
+        insights.ensure_columns(st.session_state["data"]), project
+    )
+    updated = {**project, "snapshot": projects.snapshot(after_rows)}
+    try:
+        _remember(updated)
+    except SheetsError as exc:
+        _LOG.exception("Updating the project failed")
+
+    changes = projects.describe_change(before, updated["snapshot"])
+    st.session_state["project_note"] = " ".join(changes)
+    _open_project(updated)
+
+
+def _my_projects() -> None:
+    """The saved projects, most recently updated first."""
+    saved = _known_projects()
+    if not sheets_store.is_configured():
+        st.info("Projects are stored in the Sheet, which is not connected.")
+        return
+    if not saved:
+        st.info(
+            "No projects yet. Run a search, then use Save as project below "
+            "the report to name it."
+        )
+        return
+
+    data = insights.ensure_columns(st.session_state["data"])
+    for project in saved:
+        rows = projects.rows_for(data, project)
+        shot = projects.snapshot(rows)
+        with st.container(border=True):
+            head, act = st.columns([3, 2], vertical_alignment="center")
+            with head:
+                st.subheader(project["name"])
+                st.caption(
+                    f":gray[{', '.join(project['keywords'])} on "
+                    f"{', '.join(project['platforms']) or 'any platform'} - "
+                    f"updated {str(project.get('updated_at', ''))[:16] or 'never'}]"
+                )
+            with act:
+                one, two = st.columns(2)
+                if one.button("Open", key=f"open_{project['project_id']}",
+                              width="stretch"):
+                    _open_project(project)
+                    st.rerun()
+                if two.button("Refresh", key=f"refresh_{project['project_id']}",
+                              width="stretch", type="primary"):
+                    _refresh_project(project)
+                    st.rerun()
+
+            counts = st.columns(3)
+            counts[0].metric("Comments", f"{shot['comments']:,}")
+            counts[1].metric("Classified", f"{shot['classified']:,}")
+            top = max(shot["kind"], key=shot["kind"].get) if shot["kind"] else "-"
+            counts[2].metric("Most common", top.title())
+
+            if shot["sentiment"]:
+                st.caption(
+                    "Sentiment: " + ", ".join(
+                        f"{count:,} {name}"
+                        for name, count in shot["sentiment"].items()
+                    )
+                )
+            written = st.session_state["digests"].get(
+                analysis.fingerprint(rows)
+            )
+            if written:
+                st.caption(f":gray[{written[:300]}]")
+
+
+def _classified_only(df: pd.DataFrame) -> pd.DataFrame | None:
+    """The labelled part of what is in view, or None with the usual prompt.
+
+    Shared by the two views that need labels, so the prompt and the wording
+    are written once.
+    """
+    labelled = classify.ensure_columns(df)
+    done = labelled[labelled[classify.KIND_COLUMN] != ""]
+    if done.empty:
+        st.info(
+            "None of these comments have been classified yet. Use the "
+            "Classify button above.",
+            icon=":material/label:",
+        )
+        return None
+
+    waiting = len(labelled) - len(done)
+    if waiting:
+        st.caption(
+            f"{waiting:,} comment(s) in view have not been classified and are "
+            "not counted here."
+        )
+    return done
+
+
+def _by_kind(df: pd.DataFrame) -> None:
+    """Comments grouped under what they are, whichever platform they came from."""
+    done = _classified_only(df)
+    if done is None:
+        return
+
+    counts = done[classify.KIND_COLUMN].value_counts()
+    for kind in classify.KINDS:
+        rows = done[done[classify.KIND_COLUMN] == kind]
+        if rows.empty:
+            continue
+        share = counts.get(kind, 0)
+        with st.expander(
+            f"{kind.title()} - {share:,} comment(s)",
+            key=f"kind_open_{kind}",
+        ):
+            spread = rows[classify.SENTIMENT_COLUMN].value_counts()
+            st.caption(
+                ", ".join(
+                    f"{spread.get(name, 0):,} {name}" for name in classify.SENTIMENTS
+                )
+            )
+            height = min(560, 90 + 40 * max(len(rows), 1))
+            _comment_table(rows, height=height, key=f"kind_table_{kind}")
+
+
+@st.cache_data(show_spinner=False)
+def _cached_summary(print_: str, frame: pd.DataFrame) -> str:
+    """One summary per fingerprint. The frame rides along; the print is the key."""
+    return analysis.write_summary(frame)
+
+
+def _digest(df: pd.DataFrame) -> None:
+    """The written brief, once per exact set of comments and labels."""
+    if not analysis.is_configured():
+        return
+
+    print_ = analysis.fingerprint(df)
+    written = st.session_state["digests"].get(print_)
+
+    if written:
+        st.markdown(written)
+        st.caption(
+            ":gray[Written for exactly these comments and kept with them, so "
+            "it survives a refresh. It updates when the set or its labels "
+            "change.]"
+        )
+        return
+
+    left, right = st.columns([2, 3], vertical_alignment="center")
+    with left:
+        pressed = st.button(
+            "Write the summary",
+            key=f"digest_{print_}",
+            icon=":material/edit_note:",
+            type="primary",
+        )
+    with right:
+        st.caption(
+            ":gray[One Claude call reading the counts and the most visible "
+            "comments. Kept until this set changes.]"
+        )
+    if not pressed:
+        return
+
+    try:
+        with st.spinner("Reading the comments..."):
+            written = _cached_summary(print_, df)
+    except analysis.AnalysisError as exc:
+        _LOG.exception("Summary failed")
+        st.error(str(exc))
+        return
+
+    st.session_state["digests"][print_] = written
+    if sheets_store.is_configured():
+        try:
+            sheets_store.save_digest(
+                print_,
+                written,
+                keywords=", ".join(st.session_state["session_keywords"]),
+                comments=len(df),
+            )
+            _fetch_digests.clear()
+        except SheetsError as exc:
+            # The summary is on screen either way; only its persistence failed.
+            _LOG.exception("Saving the summary failed")
+            st.session_state["insight_status"] = (
+                f"The summary was written but not saved: {exc}"
+            )
+    st.rerun()
+
+
+def _quote_wall(df: pd.DataFrame) -> None:
+    """The most visible complaints and compliments, as quotes.
+
+    First on the page and given the width, because it is the part somebody
+    acts on: a table of the same rows reads as data to be processed later.
+    """
+    left, right = st.columns(2, gap="medium")
+    for column, kind, heading in (
+        (left, "complaint", "Loudest complaints"),
+        (right, "compliment", "Loudest compliments"),
+    ):
+        with column:
+            st.subheader(heading)
+            rows = analysis.top_quotes(df, kind, limit=5)
+            if rows.empty:
+                st.caption(f"No {kind}s in this set.")
+                continue
+            for _, row in rows.iterrows():
+                with st.container(border=True):
+                    text = " ".join(str(row.get("comment_text", "")).split())
+                    english = insights.translation_of(row)
+                    st.markdown(f"> {text[:400]}")
+                    if english:
+                        st.caption(f"English: {english[:300]}")
+                    platform = str(row.get("platform", "") or "")
+                    where = str(row.get("channel_or_subreddit", "") or "")
+                    title = str(row.get("source_title", "") or "")
+                    reach = pd.to_numeric(
+                        row.get("engagement_score", 0), errors="coerce"
+                    )
+                    reach = int(reach) if pd.notna(reach) else 0
+                    noun = "upvotes" if platform == reddit_fetcher.PLATFORM else "views"
+                    st.caption(
+                        f":gray-badge[{SOURCE_NOUN.get(platform, 'Source')}] "
+                        f"{title[:60]} - {where} - {reach:,} {noun}"
+                    )
+
+
+def _share_chart(frame: pd.DataFrame, colours: dict, title: str, pie: bool):
+    """One chart. Pie for the three-way split, bars for the five-way one."""
+    order = list(colours)
+    scale = alt.Scale(domain=order, range=[colours[name] for name in order])
+    base = alt.Chart(frame, title=title)
+
+    if pie:
+        return base.mark_arc(
+            innerRadius=42, stroke="#fcfcfb", strokeWidth=2, cornerRadius=2
+        ).encode(
+            theta=alt.Theta("count:Q", stack=True),
+            color=alt.Color("label:N", scale=scale, sort=order,
+                            legend=alt.Legend(title=None, orient="bottom")),
+            order=alt.Order("label:N", sort="ascending"),
+            tooltip=["label:N", "count:Q", alt.Tooltip("share:Q", format=".0%")],
+        ).properties(height=200)
+
+    bars = base.mark_bar(cornerRadiusEnd=4, height=14).encode(
+        x=alt.X("count:Q", title=None, axis=alt.Axis(grid=True, tickCount=3)),
+        y=alt.Y("label:N", sort=order, title=None),
+        color=alt.Color("label:N", scale=scale, sort=order, legend=None),
+        tooltip=["label:N", "count:Q", alt.Tooltip("share:Q", format=".0%")],
+    )
+    # Direct labels: the light-mode contrast warning is relieved by numbers on
+    # the marks, and it saves reading values off an axis.
+    text = base.mark_text(align="left", dx=4, color="#898781").encode(
+        x="count:Q", y=alt.Y("label:N", sort=order), text="count:Q",
+    )
+    return (bars + text).properties(height=24 * len(order) + 24)
+
+
+def _breakdown(df: pd.DataFrame, column: str, colours: dict, label: str,
+               pie: bool) -> None:
+    """One chart per platform when both are present, never merged into one."""
+    platforms = [p for p in df["platform"].astype(str).unique() if p.strip()]
+    places = st.columns(len(platforms), gap="medium") if len(platforms) > 1 else [st]
+
+    for place, platform in zip(places, sorted(platforms)):
+        rows = df[df["platform"].astype(str) == platform]
+        counts = rows[column].value_counts()
+        frame = pd.DataFrame({
+            "label": list(colours),
+            "count": [int(counts.get(name, 0)) for name in colours],
+        })
+        frame["share"] = frame["count"] / max(int(frame["count"].sum()), 1)
+        title = f"{label}, {SOURCE_NOUN.get(platform, platform)}s" \
+            if len(platforms) > 1 else label
+        place.altair_chart(_share_chart(frame, colours, title, pie), width="stretch")
+
+
+def _analysis(df: pd.DataFrame) -> None:
+    """What the comments add up to: the quotes, the splits, the brief."""
+    done = _classified_only(df)
+    if done is None:
+        return
+
+    _quote_wall(done)
+
+    st.divider()
+    _digest(done)
+
+    st.divider()
+    _breakdown(done, classify.SENTIMENT_COLUMN, SENTIMENT_COLOURS,
+               "Sentiment", pie=True)
+    st.divider()
+    _breakdown(done, classify.KIND_COLUMN, KIND_COLOURS,
+               "What the comments are", pie=False)
 
 
 def _text_display(df: pd.DataFrame) -> None:
@@ -1219,6 +2426,29 @@ def _type_filter(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
+def most_recent_keyword(df: pd.DataFrame) -> str:
+    """The keyword collected most recently, by when its rows were fetched.
+
+    Dates that do not look like dates are ignored rather than sorted as text,
+    where "97" would beat "2026-09-09". A frame with no usable dates falls
+    back to the last keyword in the sheet, which is where the newest rows are.
+    """
+    if df.empty or "keyword" not in df.columns:
+        return ""
+
+    stamps = (
+        df["fetched_at"].astype(str).str.strip()
+        if "fetched_at" in df.columns
+        else pd.Series("", index=df.index)
+    )
+    dated = df.assign(_when=stamps.where(stamps.str.match(r"^\d{4}-\d{2}-\d{2}"), ""))
+    known = dated[dated["_when"] != ""]
+    if known.empty:
+        return str(df["keyword"].astype(str).iloc[-1] or "")
+    newest = known.groupby(known["keyword"].astype(str))["_when"].max()
+    return str(newest.sort_values(ascending=False).index[0])
+
+
 def _live_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Only what this session searched for.
 
@@ -1238,10 +2468,41 @@ def _keyword_csv(keyword: str, rows: int, frame: pd.DataFrame) -> bytes:
     return frame.to_csv(index=False).encode("utf-8-sig")
 
 
-def _past_searches() -> None:
-    """Every keyword ever saved, newest first, each as a download.
+def _open_keyword(keyword: str, rows: pd.DataFrame) -> None:
+    """Point the report at a keyword the Sheet already holds.
 
-    Reference and export only: nothing here loads into the report above.
+    Nothing is fetched and nothing is sent anywhere: the comments, their
+    labels and any summary written for them are already stored, so this only
+    changes what is on screen. Safe to write the widget keys here because the
+    sidebar draws before the report, so none of them exist yet this run.
+    """
+    st.session_state["session_keywords"] = [str(keyword)]
+    # It is a keyword, not a project, so nothing should claim otherwise.
+    st.session_state["open_project"] = ""
+
+    if "platform" in rows.columns:
+        present = {
+            str(value).strip().lower()
+            for value in rows["platform"].unique()
+            if str(value).strip()
+        }
+        picked = [
+            label for label, value in PLATFORM_LABELS.items() if value in present
+        ]
+        if picked:
+            st.session_state[PLATFORM_KEY] = picked
+
+    st.session_state["main_view"] = BY_VIDEO_VIEW
+    st.session_state["comment_search"] = ""
+    st.session_state["intent"] = {}
+    st.session_state["intent_note"] = ""
+
+
+def _past_searches() -> None:
+    """Every keyword ever saved, newest first, to download or to open.
+
+    Opening one is free: it reads what the Sheet already holds, labels and
+    summary included, and calls nothing.
     """
     stored = st.session_state["data"]
     if stored.empty or "keyword" not in stored.columns:
@@ -1264,19 +2525,39 @@ def _past_searches() -> None:
     st.divider()
     with st.expander(f"Past searches ({len(names)})", expanded=False):
         st.caption(
-            "Every keyword saved to the Sheet. Download one to work with it "
-            "elsewhere; the report above stays on this session's search."
+            "Every keyword saved to the Sheet. Open one to read it here, or "
+            "download it to work with elsewhere. Opening costs nothing: the "
+            "comments, their labels and any summary are already saved."
         )
+        showing = st.session_state["session_keywords"]
         for keyword in names:
             rows = stored[stored["keyword"] == keyword]
-            st.download_button(
-                f"{keyword} ({len(rows):,})",
-                data=_keyword_csv(str(keyword), len(rows), rows),
-                file_name=f"{str(keyword).replace(' ', '_')}_comments.csv",
-                mime="text/csv",
-                key=f"past_csv_{keyword}",
-                width="stretch",
+            here = list(showing) == [str(keyword)]
+            st.caption(
+                f"**{keyword}** ({len(rows):,})"
+                + (" :gray-badge[open]" if here else "")
             )
+            left, right = st.columns(2)
+            with left:
+                if st.button(
+                    "Open in app",
+                    key=f"past_open_{keyword}",
+                    width="stretch",
+                    type="primary" if not here else "secondary",
+                    disabled=here,
+                    help="Loads what is saved. No search, no Claude call.",
+                ):
+                    _open_keyword(str(keyword), rows)
+                    st.rerun()
+            with right:
+                st.download_button(
+                    "Download CSV",
+                    data=_keyword_csv(str(keyword), len(rows), rows),
+                    file_name=f"{str(keyword).replace(' ', '_')}_comments.csv",
+                    mime="text/csv",
+                    key=f"past_csv_{keyword}",
+                    width="stretch",
+                )
 
 
 def _comment_search(df: pd.DataFrame) -> pd.DataFrame:
@@ -1326,39 +2607,70 @@ def _table_config(present: Sequence[str]) -> dict:
         if label:
             config[column] = st.column_config.TextColumn(label, width=width)
 
-    numbers = {"comment_likes": "Likes", "video_views": "Views",
-               "video_comment_count": "Video comments"}
+    numbers = {"comment_likes": "Likes", "engagement_score": "Reach"}
     for column, label in numbers.items():
         if column in present:
             config[column] = st.column_config.NumberColumn(label, format="%d")
 
-    dates = {"comment_published_at": "Commented", "video_published_at": "Video posted"}
+    dates = {"comment_published_at": "Commented", "source_published_at": "Posted"}
     for column, label in dates.items():
         if column in present:
             config[column] = st.column_config.DatetimeColumn(
                 label, format="YYYY-MM-DD HH:mm"
             )
 
-    if "video_url" in present:
-        config["video_url"] = st.column_config.LinkColumn("Link", display_text="Watch")
+    if "source_url" in present:
+        config["source_url"] = st.column_config.LinkColumn("Link", display_text="Watch")
     return config
 
 
+def _metric_of(record, key: str) -> float:
+    """One number out of a row's platform_metrics blob.
+
+    Platforms name their counts differently, so the platform column decides
+    which key to read. A missing count is 0, never an error.
+    """
+    metrics = youtube_fetcher.unpack_metrics(record.get("platform_metrics"))
+    if key == _METRIC_LIKES:
+        wanted = ("likes", "ups", "score")
+    else:
+        platform = str(record.get("platform", "") or "").strip().lower()
+        named = youtube_fetcher.SOURCE_COMMENT_COUNT.get(platform)
+        wanted = tuple(x for x in (named, "comment_count", "num_comments") if x)
+    for name in wanted:
+        try:
+            return float(metrics[name])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return 0.0
+
+
 def _video_order(df: pd.DataFrame, order_label: str) -> list:
-    """Video ids in the order the chosen sort puts them, best first.
+    """Source ids in the order the chosen sort puts them, best first.
 
     "Most relevant" has no local column to sort on, so it keeps the order the
-    videos were collected in -- which is the order YouTube returned them.
+    sources were collected in -- which is the order the platform returned.
     """
-    ids = list(dict.fromkeys(df["video_id"]))
+    ids = list(dict.fromkeys(df["source_id"]))
     column = VIDEO_SORT_COLUMNS.get(order_label)
-    if column is None or column not in df.columns:
+    if column is None:
         return ids
 
-    # One value per video, taken from its first row, then sorted descending.
-    per_video = df.groupby("video_id")[column].first()
-    per_video = per_video.reindex(ids)
-    return list(per_video.sort_values(ascending=False, na_position="last").index)
+    first_rows = df.groupby("source_id").first()
+    if column in (_METRIC_LIKES, _METRIC_COMMENTS):
+        values = first_rows.apply(lambda row: _metric_of(row, column), axis=1)
+        if column == _METRIC_COMMENTS:
+            # A platform that reports no total still has the comments actually
+            # collected, which is a fair stand-in and never zero.
+            collected = df.groupby("source_id").size()
+            values = values.where(values > 0, collected)
+    elif column in df.columns:
+        values = first_rows[column]
+    else:
+        return ids
+
+    values = values.reindex(ids)
+    return list(values.sort_values(ascending=False, na_position="last").index)
 
 
 def _drilldown(df: pd.DataFrame, order_label: str) -> None:
@@ -1367,12 +2679,21 @@ def _drilldown(df: pd.DataFrame, order_label: str) -> None:
     Same table as the flat report, so the two read alike; the difference is
     only the grouping.
     """
-    if "video_id" not in df.columns:
+    if "source_id" not in df.columns:
         st.caption("These rows carry no video id, so they cannot be grouped.")
         return
 
-    titles = df.groupby("video_id")["video_title"].first()
-    counts = df.groupby("video_id").size()
+    # With one platform the kind is obvious and the label stays as it was.
+    # With both, every section says which it is, so a post is never read as a
+    # video or the other way round.
+    kinds = (
+        df.groupby("source_id")["platform"].first()
+        if "platform" in df.columns else None
+    )
+    mixed = kinds is not None and kinds.astype(str).str.strip().nunique() > 1
+
+    titles = df.groupby("source_id")["source_title"].first()
+    counts = df.groupby("source_id").size()
     ordered = _video_order(df, order_label)
 
     total = len(ordered)
@@ -1395,7 +2716,7 @@ def _drilldown(df: pd.DataFrame, order_label: str) -> None:
         default = {}
 
     page_size = st.number_input(
-        "Videos to show",
+        "Sources to show" if mixed else "Videos to show",
         min_value=VIDEO_PAGE_STEP,
         max_value=ceiling,
         step=VIDEO_PAGE_STEP,
@@ -1403,8 +2724,14 @@ def _drilldown(df: pd.DataFrame, order_label: str) -> None:
         **default,
     )
     page = ordered[: int(page_size)]
+    noun = "source" if mixed else (
+        SOURCE_NOUN.get(
+            str(kinds.iloc[0]).strip().lower() if kinds is not None and len(kinds)
+            else "", "Video",
+        ).lower()
+    )
     st.caption(
-        f"Showing {len(page):,} of {total:,} video(s), sorted by "
+        f"Showing {len(page):,} of {total:,} {noun}(s), sorted by "
         f"{order_label.lower()}."
     )
 
@@ -1412,15 +2739,29 @@ def _drilldown(df: pd.DataFrame, order_label: str) -> None:
         title = str(titles.get(video_id, "") or video_id)
         count = int(counts.get(video_id, 0))
         open_key = video_open_key(str(video_id))
+        prefix = ""
+        if mixed:
+            platform = str(kinds.get(video_id, "") or "").strip().lower()
+            prefix = SOURCE_NOUN.get(platform, "Source") + ": "
         # Set before the expander is made, which is the only moment a widget's
         # state can be written. Closed unless something asked for it to stay.
         st.session_state.setdefault(open_key, False)
 
-        with st.expander(f"{title[:90]} - {count:,} comment(s)", key=open_key):
-            rows = df[df["video_id"] == video_id]
-            url = str(rows["video_url"].iloc[0]) if "video_url" in rows else ""
+        with st.expander(
+            f"{prefix}{title[:90]} - {count:,} comment(s)", key=open_key
+        ):
+            rows = df[df["source_id"] == video_id]
+            url = str(rows["source_url"].iloc[0]) if "source_url" in rows else ""
             if url:
-                st.caption(f"[Watch on YouTube]({url})")
+                # The link says where it goes: these sections hold YouTube
+                # videos and Reddit posts side by side.
+                platform = str(rows["platform"].iloc[0] or "").strip().lower()
+                label = (
+                    "Open on Reddit"
+                    if platform == reddit_fetcher.PLATFORM
+                    else "Watch on YouTube"
+                )
+                st.caption(f"[{label}]({url})")
 
             _translate_button(rows, str(video_id), open_key)
 
@@ -1436,11 +2777,16 @@ def _drilldown(df: pd.DataFrame, order_label: str) -> None:
 # --------------------------------------------------------------------------
 def main() -> None:
     _init_state()
+    _apply_pending_open()
 
     # The manual takes the whole page, sidebar included, so nothing competes
     # with it and nobody starts a search by accident while reading.
     if st.session_state["show_help"]:
         _help_page()
+        return
+
+    if st.session_state["show_usage"]:
+        _usage_page()
         return
 
     # Everything above the results draws before the Sheet is touched. Streamlit
@@ -1472,10 +2818,17 @@ def main() -> None:
         # Safe to set here: the box is drawn further down this same run.
         st.session_state["comment_search"] = ""
         _run_search(config)
+        # A parsed request leaves the keyword it ran under waiting for the box.
+        # One more pass puts it there, so the field matches what was searched.
+        if st.session_state.get("pending_keyword"):
+            st.rerun()
 
     if st.session_state["fetch_error"]:
         st.error(st.session_state["fetch_error"])
         st.session_state["fetch_error"] = ""
+
+    if st.session_state["intent_note"]:
+        st.caption(st.session_state["intent_note"])
 
     if st.session_state["last_run"]:
         _run_summary()
@@ -1484,10 +2837,37 @@ def main() -> None:
     # The report is about this session's search. Everything else the Sheet
     # holds is downloadable from Past searches in the sidebar.
     data = _live_rows(insights.ensure_columns(st.session_state["data"]))
+
+    # The top control of the results area: what to search, and what to show.
+    _search_budget_line()
+    platforms = _platform_picker()
+    wanted = {PLATFORM_LABELS[p] for p in platforms}
+    if "platform" in data.columns and wanted:
+        known = data["platform"].astype(str).str.strip().str.lower()
+        # Rows collected before the platform column existed are YouTube's.
+        known = known.replace("", youtube_fetcher.PLATFORM_YOUTUBE)
+        data = data[known.isin(wanted)]
+
+    if st.session_state["project_note"]:
+        st.info(st.session_state["project_note"], icon=":material/bookmark:")
+        st.session_state["project_note"] = ""
+
     if data.empty:
+        # Saved projects are worth reaching even before a search has run.
+        if _known_projects():
+            view = st.segmented_control(
+                "View",
+                [PROJECTS_VIEW],
+                default=PROJECTS_VIEW,
+                key="empty_view",
+                label_visibility="collapsed",
+                width="stretch",
+            )
+            _my_projects()
+            return
         st.info(
             "Search any product or competitor name to see what people are "
-            "saying about it on YouTube."
+            "saying about it."
         )
         return
 
@@ -1498,14 +2878,18 @@ def main() -> None:
     # filters below narrow it. Full width, matching the type filter row.
     view = st.segmented_control(
         "View",
-        [BY_VIDEO_VIEW, ALL_COMMENTS_VIEW],
+        [BY_VIDEO_VIEW, ALL_COMMENTS_VIEW, BY_KIND_VIEW, ANALYSIS_VIEW,
+         PROJECTS_VIEW],
         default=BY_VIDEO_VIEW,
         key="main_view",
         label_visibility="collapsed",
         width="stretch",
     )
 
-    data = _type_filter(data)
+    # Shorts and Videos are a YouTube distinction with no Reddit equivalent,
+    # so the filter only appears when YouTube is all that is selected.
+    if platforms == [YOUTUBE]:
+        data = _type_filter(data)
     _text_display(data)
     if data.empty:
         st.info("No comments match the selected keyword(s).")
@@ -1515,12 +2899,32 @@ def main() -> None:
     if data.empty:
         return
 
+    # The requested sentiment or kind, if the comments can answer for it yet.
+    data = _intent_filter(data)
+    if data.empty:
+        st.info("No comments match that, in what has been classified so far.")
+        return
+
+    # Below every filter, so what it offers to label is what is on screen.
+    _classify_section(data)
+    if st.session_state["insight_status"]:
+        st.caption(st.session_state["insight_status"])
+        st.session_state["insight_status"] = ""
+
     if view == ALL_COMMENTS_VIEW:
         _all_comments(data)
+    elif view == BY_KIND_VIEW:
+        _by_kind(data)
+    elif view == ANALYSIS_VIEW:
+        _analysis(data)
+    elif view == PROJECTS_VIEW:
+        _my_projects()
     else:
         _drilldown(data, config["order_label"])
 
     st.divider()
+    _save_project(data, config)
+
     st.download_button(
         f"Download these {len(data):,} comments as CSV",
         data=data.to_csv(index=False).encode("utf-8-sig"),

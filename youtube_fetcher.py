@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -24,17 +25,21 @@ _LOG = logging.getLogger(__name__)
 
 # Single source of truth for the row schema. sheets_store imports this so the
 # worksheet header and the DataFrame can never drift apart.
+# The schema is platform-agnostic: a comment hangs off a "source", which is a
+# video on YouTube and will be a post on Reddit. Anything one platform counts
+# and another does not lives in platform_metrics rather than in a column of
+# its own, so adding a platform never widens the sheet.
 COLUMNS: list[str] = [
     "comment_id",
+    "platform",
     "keyword",
-    "video_id",
-    "video_title",
-    "channel_title",
-    "video_url",
-    "video_published_at",
-    "video_views",
-    "video_likes",
-    "video_comment_count",
+    "source_id",
+    "source_title",
+    "channel_or_subreddit",
+    "source_url",
+    "source_published_at",
+    "engagement_score",
+    "platform_metrics",
     "video_type",
     "comment_author",
     "comment_text",
@@ -45,6 +50,49 @@ COLUMNS: list[str] = [
     "reply_count",
     "fetched_at",
 ]
+
+# What goes in the platform column. One per source of comments.
+PLATFORM_YOUTUBE = "youtube"
+PLATFORM_REDDIT = "reddit"
+
+# Which key inside platform_metrics each platform counts as its comment total.
+# The by-source report sorts on it, and a platform that does not report one
+# falls back to counting the comments actually collected.
+SOURCE_COMMENT_COUNT = {
+    PLATFORM_YOUTUBE: "comment_count",
+    PLATFORM_REDDIT: "num_comments",
+}
+
+
+def pack_metrics(metrics: dict) -> str:
+    """Platform-specific numbers as one JSON string, for one cell of a sheet.
+
+    A column per metric would mean widening the sheet for every platform
+    added, and leaving most of it blank on every row.
+    """
+    clean = {k: v for k, v in (metrics or {}).items() if v not in (None, "")}
+    return json.dumps(clean, separators=(",", ":")) if clean else ""
+
+
+def unpack_metrics(blob: object) -> dict:
+    """The metrics blob back as a dict. Never raises on junk."""
+    text = str(blob or "").strip()
+    if not text:
+        return {}
+    try:
+        loaded = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def youtube_metrics(video: dict) -> str:
+    """The numbers YouTube reports that do not fit the shared columns."""
+    return pack_metrics({
+        "views": _as_int(video.get("video_views")),
+        "likes": _as_int(video.get("video_likes")),
+        "comment_count": _as_int(video.get("video_comment_count")),
+    })
 
 # The column that makes a row unique. Used for dedupe on write and on load.
 ID_COLUMN = "comment_id"
@@ -88,6 +136,14 @@ class FetchReport:
     videos_searched: int = 0
     videos_excluded: int = 0
     videos_irrelevant: int = 0
+    # Reddit only: posts the relevance pass judged to be about something else,
+    # and the queries actually sent after a keyword was expanded.
+    posts_off_topic: int = 0
+    queries: list[str] = field(default_factory=list)
+    # Quota units this run actually spent, counted per call at YouTube's
+    # published cost. The Data API does not report usage, so counting the
+    # calls is the accurate number rather than an estimate of one.
+    quota_units: int = 0
     videos_with_comments: int = 0
     comments_fetched: int = 0
     quota_exhausted: bool = False
@@ -274,7 +330,33 @@ def _searchable_text(video: dict) -> str:
     return " ".join(joined.lower().split())
 
 
-def is_relevant(video: dict, keywords: Sequence[str], match: str = MATCH_ANY) -> bool:
+def context_terms(keywords: Sequence[str], variants: Sequence[str]) -> list[str]:
+    """The disambiguating words a keyword was expanded with.
+
+    "chikki" expanded to "chikki snack" and "chikki peanut" leaves "snack" and
+    "peanut": the words that say which chikki is meant. Words from the keyword
+    itself are not context, they are the keyword.
+    """
+    own = {
+        word
+        for keyword in keywords
+        for word in str(keyword).lower().split()
+        if word
+    }
+    terms: list[str] = []
+    for variant in variants:
+        for word in str(variant).lower().split():
+            if word and word not in own and word not in terms:
+                terms.append(word)
+    return terms
+
+
+def is_relevant(
+    video: dict,
+    keywords: Sequence[str],
+    match: str = MATCH_ANY,
+    context: Sequence[str] = (),
+) -> bool:
     """True when the search terms actually appear in the title or description.
 
     YouTube's idea of relevance is loose: searching a brand name returns
@@ -282,6 +364,11 @@ def is_relevant(video: dict, keywords: Sequence[str], match: str = MATCH_ANY) ->
     question, and it follows the Match mode. Matching any means at least one
     term has to be there; matching all together means every one of them does,
     since that is what the reader asked for.
+
+    `context` is the second gate, and only bites when a keyword needed
+    disambiguating: the video must also carry one of those words, so a video
+    that says "chikki" about a person rather than a snack does not pass on the
+    name alone.
     """
     terms = [str(k).strip().lower() for k in keywords if str(k).strip()]
     if not terms:
@@ -289,7 +376,13 @@ def is_relevant(video: dict, keywords: Sequence[str], match: str = MATCH_ANY) ->
 
     haystack = _searchable_text(video)
     hits = (" ".join(term.split()) in haystack for term in terms)
-    return all(hits) if match == MATCH_ALL else any(hits)
+    if not (all(hits) if match == MATCH_ALL else any(hits)):
+        return False
+
+    words = [w for w in (str(c).strip().lower() for c in context) if w]
+    if not words:
+        return True
+    return any(word in haystack for word in words)
 
 
 def is_excluded(video: dict, exclude: Sequence[str]) -> bool:
@@ -325,6 +418,9 @@ def search_videos(
     if max_results <= 0:
         return []
 
+    # Counted here because only this function knows how many pages it asked
+    # for; the caller reads it off the function afterwards.
+    spent = {"search": 0}
     results: list[dict] = []
     page_token: str | None = None
 
@@ -345,6 +441,7 @@ def search_videos(
 
         try:
             response = youtube.search().list(**params).execute()
+            spent["search"] += 1
         except HttpError as exc:
             _raise_if_fatal(exc)
             raise YouTubeError(f"Search failed for '{keyword}': {exc}") from exc
@@ -369,6 +466,7 @@ def search_videos(
         if not page_token:
             break
 
+    search_videos.last_units = spent["search"] * 100
     return results[:max_results]
 
 
@@ -383,6 +481,8 @@ def get_video_stats(youtube, video_ids: Iterable[str]) -> dict[str, dict]:
     Batched 50 ids per request -- each request costs 1 unit regardless of batch
     size, so batching matters a lot for quota.
     """
+    # One unit per batched request, counted here for the caller to total.
+    get_video_stats.last_units = 0
     ids = [vid for vid in dict.fromkeys(video_ids) if vid]  # de-dupe, keep order
     if not ids:
         return {}
@@ -395,6 +495,7 @@ def get_video_stats(youtube, video_ids: Iterable[str]) -> dict[str, dict]:
                 .list(part="statistics,snippet,contentDetails", id=",".join(batch))
                 .execute()
             )
+            get_video_stats.last_units += 1
         except HttpError as exc:
             _raise_if_fatal(exc)
             # A non-fatal stats failure shouldn't lose the comments; fall through
@@ -440,6 +541,7 @@ def get_comments(
     if max_comments <= 0:
         return []
 
+    get_comments.last_units = 0
     comments: list[dict] = []
     page_token: str | None = None
     parts = "snippet,replies" if include_replies else "snippet"
@@ -457,6 +559,7 @@ def get_comments(
 
         try:
             response = youtube.commentThreads().list(**params).execute()
+            get_comments.last_units += 1
         except HttpError as exc:
             _raise_if_fatal(exc)
             reason = _error_reason(exc)
@@ -579,6 +682,7 @@ def find_videos(
     region_code: str | None = DEFAULT_REGION_CODE,
     match: str = MATCH_ANY,
     exclude: Sequence[str] | None = None,
+    context: Sequence[str] | None = None,
     progress_cb: ProgressCallback | None = None,
 ) -> tuple[list[dict], FetchReport]:
     """Find the videos to read, with their stats. No comments are fetched.
@@ -625,6 +729,7 @@ def find_videos(
                 published_after=published_after,
                 region_code=region_code,
             )
+            report.quota_units += getattr(search_videos, "last_units", 0)
         except QuotaExceededError as exc:
             report.quota_exhausted = True
             report.warn(str(exc))
@@ -676,6 +781,7 @@ def find_videos(
     if found:
         try:
             stats = get_video_stats(youtube, list(found))
+            report.quota_units += getattr(get_video_stats, "last_units", 0)
         except QuotaExceededError as exc:
             report.quota_exhausted = True
             report.warn(str(exc))
@@ -713,7 +819,7 @@ def find_videos(
     relevant = {
         video_id: entry
         for video_id, entry in found.items()
-        if is_relevant(entry, keywords, match)
+        if is_relevant(entry, keywords, match, context or ())
     }
     report.videos_irrelevant = len(found) - len(relevant)
     found = relevant
@@ -763,6 +869,7 @@ def fetch_comments_for(
                 include_replies=include_replies,
                 report=report,
             )
+            report.quota_units += getattr(get_comments, "last_units", 0)
         except QuotaExceededError as exc:
             report.quota_exhausted = True
             report.warn(str(exc))
@@ -778,15 +885,18 @@ def fetch_comments_for(
                 rows.append(
                     {
                         "comment_id": comment["comment_id"],
+                        "platform": PLATFORM_YOUTUBE,
                         "keyword": keyword,
-                        "video_id": video["video_id"],
-                        "video_title": video.get("video_title", ""),
-                        "channel_title": video.get("channel_title", ""),
-                        "video_url": video.get("video_url", ""),
-                        "video_published_at": video.get("video_published_at", ""),
-                        "video_views": video.get("video_views", 0),
-                        "video_likes": video.get("video_likes", 0),
-                        "video_comment_count": video.get("video_comment_count", 0),
+                        "source_id": video["video_id"],
+                        "source_title": video.get("video_title", ""),
+                        "channel_or_subreddit": video.get("channel_title", ""),
+                        "source_url": video.get("video_url", ""),
+                        "source_published_at": video.get("video_published_at", ""),
+                        # Views is YouTube's headline number, so it is the one
+                        # that compares across platforms. Everything else it
+                        # counts goes in the metrics blob.
+                        "engagement_score": video.get("video_views", 0),
+                        "platform_metrics": youtube_metrics(video),
                         "video_type": video.get("video_type", ""),
                         "comment_author": comment["comment_author"],
                         "comment_text": comment["comment_text"],
