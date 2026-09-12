@@ -315,20 +315,36 @@ def fetch(
         if progress_cb is not None:
             progress_cb(len(queries), steps, f"Checking {len(posts)} post(s)...")
         try:
-            verdicts = relevance.classify_posts(posts)
+            verdicts = relevance.classify_posts(posts, keyword=keyword)
         except relevance.RelevanceError as exc:
             _LOG.warning("Relevance check failed (%s); keeping every post", exc)
             report.warn(f"Posts could not be checked for relevance: {exc}")
         else:
-            kept = [p for p in posts if verdicts.get(str(p.get("id")), {}).get("is_food", True)]
-            report.posts_off_topic = len(posts) - len(kept)
-            for post in posts:
+            # A several-word keyword must appear as a whole thing. Reddit
+            # matches any word in it, so "DESi POPz" returns posts carrying
+            # only "desi", which is a common word and not a result.
+            phrase = relevance.is_phrase(keyword)
+
+            def keep(post: dict) -> bool:
                 verdict = verdicts.get(str(post.get("id")), {})
                 if not verdict.get("is_food", True):
-                    _LOG.info(
-                        "Reddit: dropped %r as %r",
-                        str(post.get("title"))[:70], verdict.get("subject"),
-                    )
+                    return False
+                return not phrase or verdict.get("mentions_keyword", True)
+
+            kept = [p for p in posts if keep(p)]
+            report.posts_off_topic = len(posts) - len(kept)
+            for post in posts:
+                if keep(post):
+                    continue
+                verdict = verdicts.get(str(post.get("id")), {})
+                why = (
+                    "not about food" if not verdict.get("is_food", True)
+                    else f"never mentions {keyword!r} as a whole"
+                )
+                _LOG.info(
+                    "Reddit: dropped %r (%s) as %r",
+                    str(post.get("title"))[:70], why, verdict.get("subject"),
+                )
             posts = kept
 
     if progress_cb is not None:

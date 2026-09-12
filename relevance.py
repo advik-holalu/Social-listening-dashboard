@@ -82,20 +82,35 @@ _EXPAND_SCHEMA = {
 }
 
 
-_CLASSIFY_SYSTEM = """You decide whether a Reddit post is about food.
+_CLASSIFY_SYSTEM = """You judge Reddit search results for a company that sells
+Indian snacks and sweets. For each post, answer two separate questions.
 
-You are filtering search results for a company that sells Indian snacks and
-sweets. A post counts as food when it is about eating, cooking, buying,
-reviewing or discussing food, snacks, sweets, drinks, restaurants, groceries or
-food brands. That includes complaints about a snack, questions about where to
-buy one, and recipe talk.
+**is_food**: is the post about food? It counts when it is about eating,
+cooking, buying, reviewing or discussing food, snacks, sweets, drinks,
+restaurants, groceries or food brands. That includes complaints about a snack,
+questions about where to buy one, and recipe talk. It does not count when the
+subject turned out to be something else: a person's name, a film, a game, a
+place, or anything where food is incidental. A post that mentions food only in
+passing while being about something else does not count.
 
-A post does not count when the keyword turned out to mean something else: a
-person's name, a film, a game, a place, or any other subject where food is
-incidental. When a post only mentions food in passing while being about
-something else, it does not count.
+**mentions_keyword**: does the post actually mention the keyword you are given,
+as a whole thing? This matters most when the keyword is several words. Reddit's
+search matches any word, so a search for "DESi POPz" returns posts containing
+only "desi", which is a common word meaning South Asian and says nothing about
+the product.
 
-Judge the post, not the keyword. Answer for every post you are given, using the
+The whole keyword counts as mentioned when it appears together, allowing for:
+
+- capitalisation and spacing, "DESi POPz", "desi popz", "Desi Popz", "desipopz"
+- ordinary plurals and singulars, "desi pop" and "desi pops"
+- small misspellings a person would make, "desi popz" and "desi popz."
+
+It does not count when only one part of the phrase appears on its own, however
+often: "desi food", "desi households", "desi parents", "ABCDesi" are not
+mentions of "DESi POPz". A single-word keyword is mentioned when that word
+appears.
+
+Judge each post on its own text. Answer for every post you are given, using the
 index it was given."""
 
 
@@ -109,9 +124,10 @@ _CLASSIFY_SCHEMA = {
                 "properties": {
                     "index": {"type": "integer"},
                     "is_food": {"type": "boolean"},
+                    "mentions_keyword": {"type": "boolean"},
                     "subject": {"type": "string"},
                 },
-                "required": ["index", "is_food", "subject"],
+                "required": ["index", "is_food", "mentions_keyword", "subject"],
                 "additionalProperties": False,
             },
         }
@@ -241,12 +257,21 @@ def expand_keyword(
     return queries[:variants]
 
 
-def classify_posts(posts: Sequence[dict], client=None) -> dict[str, dict]:
-    """Which posts are actually about food, keyed by post id.
+def is_phrase(keyword: str) -> bool:
+    """True when a keyword is several words, so a fragment must not pass."""
+    return len(str(keyword or "").split()) > 1
 
-    Each value is {"is_food": bool, "subject": str}. Batched, never one call
-    per post. A post Claude does not answer for is kept, because dropping a
-    real result is worse than keeping a doubtful one.
+
+def classify_posts(
+    posts: Sequence[dict], keyword: str = "", client=None
+) -> dict[str, dict]:
+    """What each post is, keyed by post id.
+
+    Each value is {"is_food", "mentions_keyword", "subject"}. The keyword is
+    passed in because judging a mention needs the whole phrase: Reddit matches
+    any word in it, so a post carrying one common fragment is not a result.
+    Batched, never one call per post. A post Claude does not answer for is
+    kept, because dropping a real result is worse than keeping a doubtful one.
     """
     wanted = [p for p in posts if str(p.get("id", "") or "").strip()]
     if not wanted:
@@ -266,8 +291,10 @@ def classify_posts(posts: Sequence[dict], client=None) -> dict[str, dict]:
             for i, post in enumerate(batch)
         )
         prompt = (
-            f"Decide for each of these {len(batch)} Reddit posts whether it is "
-            "about food. Give a two or three word subject for each, so the "
+            f"Keyword searched: {keyword or '(none given)'}\n\n"
+            f"For each of these {len(batch)} Reddit posts, say whether it is "
+            "about food and whether it mentions that keyword as a whole "
+            "thing. Give a two or three word subject for each, so the "
             "decision can be checked.\n\n" + listing
         )
         payload = ask_json(client, _CLASSIFY_SYSTEM, prompt, _CLASSIFY_SCHEMA,
@@ -283,13 +310,15 @@ def classify_posts(posts: Sequence[dict], client=None) -> dict[str, dict]:
             post_id = str(batch[position].get("id"))
             verdicts[post_id] = {
                 "is_food": bool(entry.get("is_food")),
+                "mentions_keyword": bool(entry.get("mentions_keyword")),
                 "subject": str(entry.get("subject", "") or "").strip(),
             }
 
     # Anything the model skipped stays in. Silence is not a rejection.
     for post in wanted:
         verdicts.setdefault(
-            str(post.get("id")), {"is_food": True, "subject": "not judged"}
+            str(post.get("id")),
+            {"is_food": True, "mentions_keyword": True, "subject": "not judged"},
         )
     return verdicts
 

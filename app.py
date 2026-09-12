@@ -2533,31 +2533,39 @@ def _past_searches() -> None:
         for keyword in names:
             rows = stored[stored["keyword"] == keyword]
             here = list(showing) == [str(keyword)]
-            st.caption(
-                f"**{keyword}** ({len(rows):,})"
-                + (" :gray-badge[open]" if here else "")
-            )
-            left, right = st.columns(2)
-            with left:
-                if st.button(
-                    "Open in app",
-                    key=f"past_open_{keyword}",
-                    width="stretch",
-                    type="primary" if not here else "secondary",
-                    disabled=here,
-                    help="Loads what is saved. No search, no Claude call.",
-                ):
-                    _open_keyword(str(keyword), rows)
-                    st.rerun()
-            with right:
-                st.download_button(
-                    "Download CSV",
-                    data=_keyword_csv(str(keyword), len(rows), rows),
-                    file_name=f"{str(keyword).replace(' ', '_')}_comments.csv",
-                    mime="text/csv",
-                    key=f"past_csv_{keyword}",
-                    width="stretch",
+
+            # One bordered row per keyword, the way a source section reads in
+            # the report: the name and its count on a line, the two actions
+            # beneath on one row. Two full-width buttons stacked under a
+            # caption took four lines each and wrapped "Download CSV" in half.
+            with st.container(border=True, gap="small"):
+                st.caption(
+                    f"**{keyword}** ({len(rows):,})"
+                    + (" :gray-badge[open]" if here else "")
                 )
+                with st.container(horizontal=True, gap="small"):
+                    if st.button(
+                        "Open",
+                        key=f"past_open_{keyword}",
+                        icon=":material/open_in_new:",
+                        type="primary" if not here else "secondary",
+                        disabled=here,
+                        help=(
+                            "Already open" if here else
+                            "Loads what is saved. No search, no Claude call."
+                        ),
+                    ):
+                        _open_keyword(str(keyword), rows)
+                        st.rerun()
+                    st.download_button(
+                        "CSV",
+                        data=_keyword_csv(str(keyword), len(rows), rows),
+                        file_name=f"{str(keyword).replace(' ', '_')}_comments.csv",
+                        mime="text/csv",
+                        key=f"past_csv_{keyword}",
+                        icon=":material/download:",
+                        help="Download this keyword's comments.",
+                    )
 
 
 def _comment_search(df: pd.DataFrame) -> pd.DataFrame:

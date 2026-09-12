@@ -248,8 +248,24 @@ snack", "chikki peanut". A variant that drops the keyword is discarded. Each
 query is a separate actor run, so one search spends three of the plan's five
 monthly runs, which the sidebar states.
 
-**After**: every post that comes back is read in batches of
-`BATCH_SIZE` (20) and judged food or not food. Posts that are not are dropped
+**After**: every post that comes back is read in batches of `BATCH_SIZE` (20)
+and judged on two things, in the one call: is it about food, and does it
+mention the keyword as a whole thing.
+
+The second question exists because Reddit matches any word in a phrase. A
+search for "DESi POPz" returns posts carrying only "desi", a common word for
+South Asian that says nothing about the product, so a fragment alone is not a
+result. The whole keyword is passed to Claude as the context for what counts,
+and close variants pass: capitalisation, spacing, "desipopz", ordinary plurals,
+small misspellings. Fragments do not: "desi food", "desi parents", "ABCDesis".
+The rule only applies to keywords of more than one word (`is_phrase`), so a
+single-word search behaves exactly as before.
+
+That catches posts the food question alone would keep. "Best desi snacks for a
+party?" is genuinely about food and still goes, because it never names the
+product.
+
+Posts are judged food or not food. Posts that are not are dropped
 before anything is shown or saved, and the run summary says how many went. On
 30 real posts from stored runs it kept 12 and dropped 18, correctly rejecting
 the Bollywood Panday posts and three D&D race posts while keeping the
@@ -289,6 +305,11 @@ unchanged. **Open in app** points the whole report at that keyword's saved
 comments: by source, by all comments, by kind and Analysis all fill from what
 the Sheet already holds, including any classification labels and any summary
 written for exactly that set.
+
+Each entry is one bordered row, the way a source section reads in the report:
+the keyword and its count on a line, the two actions beneath on one row. Two
+full-width buttons stacked under a caption took four lines each and wrapped
+"Download CSV" in half in a sidebar that narrow.
 
 It calls nothing. No YouTube, no Reddit, no Claude - it only changes what is on
 screen, because the rows, their labels and the digest are already stored. The
